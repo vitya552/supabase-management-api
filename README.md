@@ -122,6 +122,22 @@ curl -X PATCH "http://localhost:8085/platform/projects/default/config/postgrest"
   -d '{"max_rows": 500}'
 ```
 
+### Postgres configuration
+
+Runtime updates to a curated set of Postgres settings (the same set as the
+platform `config/database/postgres` endpoint: `statement_timeout`, `work_mem`,
+logging toggles, WAL/replication limits, ...), applied via `ALTER SYSTEM` +
+`pg_reload_conf()`. Settings that Postgres can only apply at startup (e.g.
+`shared_buffers`, `max_connections`) are persisted and take effect the next
+time the database container restarts.
+
+```bash
+curl -X PUT "http://localhost:8085/platform/projects/default/config/database/postgres" \
+  -H "Authorization: Bearer $MANAGEMENT_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"statement_timeout": "60s", "work_mem": "8MB"}'
+```
+
 ## Environment
 
 | Var | Default | Description |

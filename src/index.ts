@@ -14,6 +14,13 @@ import {
   writeFunctionFiles,
   writeSecretsFile,
 } from './functions.js'
+import {
+  getPostgresConfig,
+  isManagedGuc,
+  type PostgresConfigValue,
+  updatePostgresConfig,
+  validateGucValue,
+} from './postgres-config.js'
 import { getPostgrestConfig, updatePostgrestConfig } from './postgrest.js'
 import {
   type ConfigValue,
@@ -376,6 +383,32 @@ app.patch('/platform/projects/:ref/config/postgrest', async (c) => {
     patch.db_pool = payload.db_pool
   }
   return c.json(await updatePostgrestConfig(patch))
+})
+
+// -- Postgres configuration ---------------------------------------------
+
+app.get('/platform/projects/:ref/config/database/postgres', async (c) => {
+  return c.json(await getPostgresConfig())
+})
+
+app.put('/platform/projects/:ref/config/database/postgres', async (c) => {
+  const payload = await c.req.json<Record<string, unknown>>()
+  const patch: Record<string, PostgresConfigValue> = {}
+  for (const [name, value] of Object.entries(payload)) {
+    if (name === 'restart_database') continue
+    if (!isManagedGuc(name)) return c.json({ message: `unsupported setting: ${name}` }, 400)
+    const error = validateGucValue(name, value)
+    if (error) return c.json({ message: error }, 400)
+    patch[name] = value as PostgresConfigValue
+  }
+
+  try {
+    const result = await updatePostgresConfig(patch)
+    return c.json(result.config)
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    return c.json({ message }, 400)
+  }
 })
 
 async function main() {
