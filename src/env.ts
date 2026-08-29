@@ -40,4 +40,17 @@ export const env = {
   authCallbackUrl:
     process.env.AUTH_CALLBACK_URL ??
     (process.env.API_EXTERNAL_URL ? `${process.env.API_EXTERNAL_URL}/auth/v1/callback` : ''),
+
+  /**
+   * The stack's JWT secret. Needed to keep first-party API keys working when
+   * third-party auth integrations extend PostgREST's trusted key set.
+   */
+  jwtSecret: process.env.JWT_SECRET ?? '',
+
+  /**
+   * Dashboard login credentials, checked by the gateway via ext_authz.
+   * Unset disables the dashboard session endpoints.
+   */
+  dashboardUsername: process.env.DASHBOARD_USERNAME ?? '',
+  dashboardPassword: process.env.DASHBOARD_PASSWORD ?? '',
 }

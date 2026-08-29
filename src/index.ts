@@ -4,7 +4,18 @@ import { logger } from 'hono/logger'
 
 import { AUTH_CONFIG_KEYS } from './auth-config-keys.js'
 import { baselineConfig } from './baseline.js'
+import {
+  createSessionToken,
+  getCookie,
+  isValidBasicAuthHeader,
+  isValidCredentials,
+  isValidSessionToken,
+  renderLoginPage,
+  sanitizeRedirectPath,
+  SESSION_COOKIE,
+} from './dashboard-auth.js'
 import { renderReactEmail } from './emails.js'
+import { defaultAuthConfig } from './gotrue-defaults.js'
 import { env } from './env.js'
 import { syncEnvFile, templateTypeFromConfigKey } from './envfile.js'
 import {
@@ -41,6 +52,14 @@ import {
   upsertEmailTemplate,
   upsertFunctionSecrets,
 } from './store.js'
+import {
+  createIntegration,
+  deleteIntegration,
+  getIntegration,
+  listIntegrations,
+  migrateThirdPartyAuth,
+  type ThirdPartyIntegration,
+} from './third-party-auth.js'
 
 const app = new Hono()
 
@@ -119,7 +138,7 @@ async function applyConfigPatch(payload: Record<string, unknown>) {
 }
 
 async function currentConfig() {
-  return { ...baselineConfig(), ...(await getAllConfig()) }
+  return { ...defaultAuthConfig(), ...baselineConfig(), ...(await getAllConfig()) }
 }
 
 app.get('/platform/auth/:ref/config', async (c) => {
@@ -301,10 +320,11 @@ app.use('/platform/projects/:ref/secrets', async (c, next) => {
 
 app.get('/platform/projects/:ref/secrets', async (c) => {
   const secrets = await getFunctionSecrets()
+  // Secret values are write-only through the API: the list response only
+  // exposes names and metadata.
   return c.json(
     secrets.map((secret) => ({
       name: secret.name,
-      value: secret.value,
       updated_at: new Date(secret.updated_at).toISOString(),
     }))
   )
@@ -342,6 +362,97 @@ app.delete('/platform/projects/:ref/secrets', async (c) => {
   await deleteFunctionSecrets(payload)
   await syncSecretsFile()
   return c.json({})
+})
+
+// -- Third-party auth ----------------------------------------------------
+
+function thirdPartyResponse(integration: ThirdPartyIntegration) {
+  return {
+    id: integration.id,
+    type: integration.type,
+    oidc_issuer_url: integration.oidc_issuer_url,
+    jwks_url: integration.jwks_url,
+    custom_jwks: integration.custom_jwks,
+    resolved_jwks: integration.resolved_jwks,
+    resolved_at: integration.resolved_at
+      ? new Date(integration.resolved_at).toISOString()
+      : null,
+    inserted_at: new Date(integration.inserted_at).toISOString(),
+    updated_at: new Date(integration.updated_at).toISOString(),
+  }
+}
+
+app.get('/platform/projects/:ref/config/auth/third-party-auth', async (c) => {
+  return c.json((await listIntegrations()).map(thirdPartyResponse))
+})
+
+app.post('/platform/projects/:ref/config/auth/third-party-auth', async (c) => {
+  const payload = await c.req.json<{
+    oidc_issuer_url?: string | null
+    jwks_url?: string | null
+    custom_jwks?: unknown
+  }>()
+  try {
+    const integration = await createIntegration(payload)
+    return c.json(thirdPartyResponse(integration), 201)
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    return c.json({ message }, 400)
+  }
+})
+
+app.get('/platform/projects/:ref/config/auth/third-party-auth/:id', async (c) => {
+  const integration = await getIntegration(c.req.param('id'))
+  if (!integration) return c.json({ message: 'integration not found' }, 404)
+  return c.json(thirdPartyResponse(integration))
+})
+
+app.delete('/platform/projects/:ref/config/auth/third-party-auth/:id', async (c) => {
+  const integration = await deleteIntegration(c.req.param('id'))
+  if (!integration) return c.json({ message: 'integration not found' }, 404)
+  return c.json(thirdPartyResponse(integration))
+})
+
+// -- Dashboard authentication ---------------------------------------------
+//
+// Serves a real login page for the dashboard and validates sessions for the
+// gateway's ext_authz filter, replacing the browser Basic Auth prompt.
+
+app.get('/dashboard-auth/check', (c) => {
+  const cookie = c.req.header('cookie') ?? ''
+  const token = getCookie(cookie, SESSION_COOKIE)
+  if (token && isValidSessionToken(token)) return c.body(null, 200)
+  // Keep Basic Auth working for programmatic access (e.g. curl, older tools).
+  const authorization = c.req.header('authorization') ?? ''
+  if (authorization && isValidBasicAuthHeader(authorization)) return c.body(null, 200)
+  return c.body(null, 401)
+})
+
+app.get('/dashboard-auth/login', (c) => {
+  const redirectTo = sanitizeRedirectPath(c.req.query('redirect_to'))
+  return c.html(renderLoginPage({ redirectTo }))
+})
+
+app.post('/dashboard-auth/login', async (c) => {
+  const form = await c.req.formData()
+  const username = String(form.get('username') ?? '')
+  const password = String(form.get('password') ?? '')
+  const redirectTo = sanitizeRedirectPath(String(form.get('redirect_to') ?? '/'))
+
+  if (!isValidCredentials(username, password)) {
+    return c.html(renderLoginPage({ redirectTo, errorMessage: 'Invalid username or password' }), 401)
+  }
+
+  c.header(
+    'Set-Cookie',
+    `${SESSION_COOKIE}=${createSessionToken()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800`
+  )
+  return c.redirect(redirectTo, 303)
+})
+
+app.post('/dashboard-auth/logout', (c) => {
+  c.header('Set-Cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`)
+  return c.redirect('/dashboard-auth/login', 303)
 })
 
 // -- PostgREST configuration --------------------------------------------
@@ -413,6 +524,7 @@ app.put('/platform/projects/:ref/config/database/postgres', async (c) => {
 
 async function main() {
   await migrate()
+  await migrateThirdPartyAuth()
   await syncEnvFile()
   serve({ fetch: app.fetch, port: env.port }, (info) => {
     console.log(`management-api listening on :${info.port}`)
