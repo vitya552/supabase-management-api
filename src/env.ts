@@ -25,6 +25,17 @@ export const env = {
    */
   selfUrl: process.env.SELF_URL ?? 'http://management-api:8085',
 
+  /**
+   * Shared edge functions volume (also mounted by edge-runtime). Unset
+   * disables the edge-functions management endpoints.
+   */
+  functionsDir: process.env.FUNCTIONS_DIR ?? '',
+
+  /** Env defaults for PostgREST config, mirroring the postgrest service. */
+  pgrstDbSchemas: process.env.PGRST_DB_SCHEMAS ?? 'public,graphql_public,storage',
+  pgrstDbMaxRows: Number(process.env.PGRST_DB_MAX_ROWS) || 1000,
+  pgrstDbExtraSearchPath: process.env.PGRST_DB_EXTRA_SEARCH_PATH ?? 'public',
+
   /** OAuth callback URL advertised to providers (public URL of the stack). */
   authCallbackUrl:
     process.env.AUTH_CALLBACK_URL ??

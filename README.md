@@ -81,6 +81,47 @@ The component receives GoTrue's template variables as props
 `redirectTo`, `data`); their values are Go-template tokens that GoTrue
 substitutes at send time. See `emails/confirmation-example.tsx`.
 
+### Edge Functions
+
+Deploy (multipart, same contract as the platform `functions/deploy` endpoint),
+list, update, and delete functions. Files are written atomically into the
+functions volume shared with edge-runtime, which picks them up per request —
+no restarts and no manual file creation.
+
+```bash
+curl -X POST "http://localhost:8085/platform/projects/default/functions/deploy?slug=hello" \
+  -H "Authorization: Bearer $MANAGEMENT_API_TOKEN" \
+  -F 'metadata={"name":"hello","verify_jwt":false,"entrypoint_path":"index.ts"}' \
+  -F 'file=@index.ts;filename=index.ts'
+
+curl "http://localhost:8085/platform/projects/default/functions" \
+  -H "Authorization: Bearer $MANAGEMENT_API_TOKEN"
+```
+
+Function secrets are persisted in Postgres and mirrored to a
+`.secrets.json` file in the functions volume; the `main` dispatcher merges it
+into each worker's environment (applies as workers recycle, ~1 min):
+
+```bash
+curl -X POST "http://localhost:8085/platform/projects/default/secrets" \
+  -H "Authorization: Bearer $MANAGEMENT_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '[{"name":"MY_SECRET","value":"..."}]'
+```
+
+### PostgREST configuration
+
+Runtime updates to exposed schemas, max rows, extra search path, and pool
+size, applied via `ALTER ROLE authenticator SET pgrst.*` +
+`NOTIFY pgrst, 'reload config'` — no env edits or restarts.
+
+```bash
+curl -X PATCH "http://localhost:8085/platform/projects/default/config/postgrest" \
+  -H "Authorization: Bearer $MANAGEMENT_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"max_rows": 500}'
+```
+
 ## Environment
 
 | Var | Default | Description |
@@ -92,6 +133,8 @@ substitutes at send time. See `emails/confirmation-example.tsx`.
 | `SELF_URL` | `http://management-api:8085` | This service's URL as seen by GoTrue |
 | `AUTH_CALLBACK_URL` | `${API_EXTERNAL_URL}/auth/v1/callback` | OAuth redirect URI advertised for enabled providers |
 | `AUTH_DEFAULT_*` | — | Baseline values shown before any runtime override exists (e.g. `AUTH_DEFAULT_SITE_URL`) |
+| `FUNCTIONS_DIR` | — | Shared edge functions volume; unset disables function management |
+| `PGRST_DB_SCHEMAS` / `PGRST_DB_MAX_ROWS` / `PGRST_DB_EXTRA_SEARCH_PATH` | mirrors postgrest service | Env defaults reported until overridden at runtime |
 
 ## Development
 
