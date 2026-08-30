@@ -52,7 +52,17 @@ async function compose(ref: string, args: string[]): Promise<void> {
       projectDir(ref),
       ...args,
     ],
-    { timeout: COMPOSE_TIMEOUT_MS, env: process.env }
+    // Minimal environment: OS env takes precedence over --env-file during
+    // compose interpolation, so the main stack's JWT_SECRET/POSTGRES_PASSWORD
+    // (present in this container) must not leak into project stacks.
+    {
+      timeout: COMPOSE_TIMEOUT_MS,
+      env: {
+        PATH: process.env.PATH ?? '',
+        HOME: process.env.HOME ?? '/tmp',
+        ...(process.env.DOCKER_HOST ? { DOCKER_HOST: process.env.DOCKER_HOST } : {}),
+      },
+    }
   )
 }
 
