@@ -88,6 +88,9 @@ export function renderEnvFile(
   }
 
   for (const templateType of [...templateTypes].sort()) {
+    // The type becomes part of an env variable name, so anything that is not a
+    // plain identifier is skipped rather than escaped.
+    if (!/^[a-z0-9_]+$/.test(templateType)) continue
     lines.push(
       `GOTRUE_MAILER_TEMPLATES_${templateType.toUpperCase()}=${escapeEnvValue(
         `${env.selfUrl}/templates/${templateType}`

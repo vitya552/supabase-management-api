@@ -47,12 +47,32 @@ export const env = {
    */
   jwtSecret: process.env.JWT_SECRET ?? '',
 
+  /** Asymmetric key set of the stack, when configured (JWT_JWKS). */
+  jwtJwks: process.env.JWT_JWKS ?? '',
+
+  /**
+   * File (shared with the postgrest service through a volume, referenced by
+   * `PGRST_JWT_SECRET=@<path>`) holding the JWK set PostgREST trusts. Written
+   * instead of a role setting so the symmetric key never lands in the
+   * database catalog, which every role can read.
+   */
+  postgrestJwksFile: process.env.PGRST_JWKS_FILE ?? '/etc/postgrest-runtime/jwt-secret.json',
+
   /**
    * Dashboard login credentials, checked by the gateway via ext_authz.
    * Unset disables the dashboard session endpoints.
    */
   dashboardUsername: process.env.DASHBOARD_USERNAME ?? '',
   dashboardPassword: process.env.DASHBOARD_PASSWORD ?? '',
+
+  /**
+   * Key signing dashboard session cookies. Kept separate from the management
+   * token so leaking one does not grant the other.
+   */
+  dashboardSessionSecret: process.env.DASHBOARD_SESSION_SECRET ?? '',
+
+  /** Set when the stack is served over HTTPS, so session cookies get `Secure`. */
+  publicUrl: process.env.SUPABASE_PUBLIC_URL ?? '',
 
   /**
    * Key used to encrypt secret values at rest (AES-256-GCM). Falls back to

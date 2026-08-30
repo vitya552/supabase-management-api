@@ -19,6 +19,14 @@ test('rejects source without a component default export', async () => {
   await assert.rejects(() => renderReactEmail('export default 42'))
 })
 
+test('denies access to Node modules outside the react-email allowlist', async () => {
+  const source = `
+    const cp = require('node:child_process')
+    export default function Email() { return null }
+  `
+  await assert.rejects(() => renderReactEmail(source), /not available to email templates/)
+})
+
 test('rejects source that fails to compile', async () => {
   await assert.rejects(() => renderReactEmail('const = broken syntax'))
 })

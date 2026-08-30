@@ -1,58 +1,81 @@
-import { createRequire } from 'node:module'
-import vm from 'node:vm'
+import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 
-import { render } from '@react-email/render'
-import { transform } from 'esbuild'
-import { createElement, type ComponentType } from 'react'
+export {
+  GOTRUE_TEMPLATE_PROPS,
+  type GoTrueTemplateProps,
+} from './render-email-worker.js'
 
-const require = createRequire(import.meta.url)
-
-/**
- * Props passed to react-email templates. Values are GoTrue Go-template
- * tokens: they survive rendering as literal strings and GoTrue substitutes
- * them when the email is sent.
- */
-export const GOTRUE_TEMPLATE_PROPS = {
-  confirmationURL: '{{ .ConfirmationURL }}',
-  token: '{{ .Token }}',
-  tokenHash: '{{ .TokenHash }}',
-  siteURL: '{{ .SiteURL }}',
-  email: '{{ .Email }}',
-  newEmail: '{{ .NewEmail }}',
-  redirectTo: '{{ .RedirectTo }}',
-  data: '{{ .Data }}',
-} as const
-
-export type GoTrueTemplateProps = Record<keyof typeof GOTRUE_TEMPLATE_PROPS, string>
+// Compiled deployments run the emitted .js worker; `tsx` (dev, tests) runs the
+// TypeScript source directly and needs its loader in the child process.
+const IS_TS_SOURCE = import.meta.url.endsWith('.ts')
+const WORKER_PATH = fileURLToPath(
+  new URL(IS_TS_SOURCE ? './render-email-worker.ts' : './render-email-worker.js', import.meta.url)
+)
+const WORKER_ARGV = IS_TS_SOURCE ? ['--import', 'tsx', WORKER_PATH] : [WORKER_PATH]
+const RENDER_TIMEOUT_MS = 15_000
+const MAX_SOURCE_BYTES = 512 * 1024
+const MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 
 /**
- * Compiles a react-email TSX/JSX module source and renders its default
- * export to HTML. The module may import react and @react-email/components.
+ * Renders TSX react-email source to HTML in a separate process that is
+ * started without any environment variables, so template code (which is
+ * user input) can never read the API's secrets.
  */
 export async function renderReactEmail(source: string): Promise<string> {
-  const { code } = await transform(source, {
-    loader: 'tsx',
-    format: 'cjs',
-    jsx: 'automatic',
-    target: 'node20',
-  })
-
-  const module = { exports: {} as { default?: ComponentType<GoTrueTemplateProps> } }
-  const context = vm.createContext({
-    module,
-    exports: module.exports,
-    require,
-    process: { env: {} },
-    console,
-  })
-  new vm.Script(code, { filename: 'email-template.tsx' }).runInContext(context, {
-    timeout: 5_000,
-  })
-
-  const Component = module.exports.default
-  if (typeof Component !== 'function') {
-    throw new Error('react email template must have a React component as its default export')
+  if (Buffer.byteLength(source, 'utf8') > MAX_SOURCE_BYTES) {
+    throw new Error('template source is too large')
   }
 
-  return render(createElement(Component, { ...GOTRUE_TEMPLATE_PROPS }))
+  const child = spawn(process.execPath, WORKER_ARGV, {
+    env: { EMAIL_RENDER_WORKER: '1', ...(IS_TS_SOURCE ? { PATH: process.env.PATH ?? '' } : {}) },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+
+  const stdout: Buffer[] = []
+  let stdoutBytes = 0
+  const stderr: Buffer[] = []
+
+  const finished = new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL')
+      reject(new Error('rendering the template timed out'))
+    }, RENDER_TIMEOUT_MS)
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdoutBytes += chunk.length
+      if (stdoutBytes > MAX_OUTPUT_BYTES) {
+        child.kill('SIGKILL')
+        return
+      }
+      stdout.push(chunk)
+    })
+    child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk))
+    child.on('error', (err) => {
+      clearTimeout(timer)
+      reject(err)
+    })
+    child.on('close', () => {
+      clearTimeout(timer)
+      resolve()
+    })
+  })
+
+  child.stdin.end(source, 'utf8')
+  await finished
+
+  if (stdoutBytes > MAX_OUTPUT_BYTES) throw new Error('rendered template is too large')
+
+  const raw = Buffer.concat(stdout).toString('utf8')
+  let result: { html?: unknown; error?: unknown }
+  try {
+    result = JSON.parse(raw)
+  } catch {
+    const detail = Buffer.concat(stderr).toString('utf8').trim().split('\n').at(-1) ?? ''
+    throw new Error(`template renderer failed${detail ? `: ${detail}` : ''}`)
+  }
+
+  if (typeof result.error === 'string') throw new Error(result.error)
+  if (typeof result.html !== 'string') throw new Error('template renderer returned no HTML')
+  return result.html
 }

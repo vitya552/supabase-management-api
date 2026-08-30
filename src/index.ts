@@ -1,17 +1,20 @@
 import { serve } from '@hono/node-server'
 import { Hono } from 'hono'
 import { logger } from 'hono/logger'
-import { createHash } from 'node:crypto'
+import { createHash, timingSafeEqual } from 'node:crypto'
 
 import { AUTH_CONFIG_KEYS } from './auth-config-keys.js'
 import { baselineConfig } from './baseline.js'
 import {
   createSessionToken,
   getCookie,
+  isLoginRateLimited,
   isValidBasicAuthHeader,
   isValidCredentials,
   isValidSessionToken,
+  resetLoginRateLimit,
   sanitizeRedirectPath,
+  sessionCookie,
   SESSION_COOKIE,
 } from './dashboard-auth.js'
 import { renderReactEmail } from './emails.js'
@@ -23,6 +26,7 @@ import {
   type FunctionFile,
   isValidSlug,
   writeFunctionFiles,
+  writeManifestFile,
   writeSecretsFile,
 } from './functions.js'
 import {
@@ -58,6 +62,7 @@ import {
   getIntegration,
   listIntegrations,
   migrateThirdPartyAuth,
+  syncThirdPartyJwks,
   type ThirdPartyIntegration,
 } from './third-party-auth.js'
 
@@ -77,10 +82,15 @@ app.get('/templates/:type', async (c) => {
   return c.html(template.rendered_html)
 })
 
+function isValidApiToken(authorization: string): boolean {
+  const expected = Buffer.from(`Bearer ${env.apiToken}`)
+  const provided = Buffer.from(authorization)
+  return expected.length === provided.length && timingSafeEqual(expected, provided)
+}
+
 // Everything under /platform requires the management token.
 app.use('/platform/*', async (c, next) => {
-  const auth = c.req.header('authorization') ?? ''
-  if (auth !== `Bearer ${env.apiToken}`) {
+  if (!isValidApiToken(c.req.header('authorization') ?? '')) {
     return c.json({ message: 'Unauthorized' }, 401)
   }
   await next()
@@ -159,8 +169,25 @@ app.patch('/platform/auth/:ref/config/hooks', async (c) => {
   return c.json(await currentConfig())
 })
 
-app.post('/platform/auth/:ref/templates/:template/reset', async (c) => {
+/**
+ * Template types GoTrue knows about, derived from the config keys it accepts.
+ * Anything else is rejected so a template name can never reach the generated
+ * env file, whose lines are keyed by it.
+ */
+const TEMPLATE_TYPES = new Set(
+  Object.keys(AUTH_CONFIG_KEYS)
+    .map(templateTypeFromConfigKey)
+    .filter((type): type is string => type !== null)
+)
+
+function templateParam(c: { req: { param: (name: string) => string } }): string | null {
   const template = c.req.param('template').toLowerCase()
+  return TEMPLATE_TYPES.has(template) ? template : null
+}
+
+app.post('/platform/auth/:ref/templates/:template/reset', async (c) => {
+  const template = templateParam(c)
+  if (!template) return c.json({ message: 'unknown template type' }, 400)
   await deleteEmailTemplate(template)
   await deleteConfig([
     `MAILER_TEMPLATES_${template.toUpperCase()}_CONTENT`,
@@ -176,7 +203,8 @@ app.post('/platform/auth/:ref/templates/:template/reset', async (c) => {
  * HTML and wires it up as the GoTrue template for the given type.
  */
 app.put('/platform/auth/:ref/templates/:template/react', async (c) => {
-  const template = c.req.param('template').toLowerCase()
+  const template = templateParam(c)
+  if (!template) return c.json({ message: 'unknown template type' }, 400)
   const { source } = await c.req.json<{ source?: string }>()
   if (!source || typeof source !== 'string') {
     return c.json({ message: 'body must contain a `source` string' }, 400)
@@ -202,7 +230,9 @@ app.put('/platform/auth/:ref/templates/:template/react', async (c) => {
 })
 
 app.get('/platform/auth/:ref/templates/:template/react', async (c) => {
-  const template = await getEmailTemplate(c.req.param('template').toLowerCase())
+  const type = templateParam(c)
+  if (!type) return c.json({ message: 'unknown template type' }, 400)
+  const template = await getEmailTemplate(type)
   if (!template || template.source_format !== 'react') {
     return c.json({ message: 'react template not found' }, 404)
   }
@@ -210,6 +240,14 @@ app.get('/platform/auth/:ref/templates/:template/react', async (c) => {
 })
 
 // -- Edge Functions -----------------------------------------------------
+
+const MAX_FUNCTION_FILES = 100
+const MAX_FUNCTION_BYTES = 10 * 1024 * 1024
+
+/** Republishes per-function settings the `main` dispatcher enforces. */
+async function syncFunctionManifest() {
+  await writeManifestFile(env.functionsDir, await getEdgeFunctions())
+}
 
 function functionResponse(fn: EdgeFunctionRecord) {
   return {
@@ -258,9 +296,18 @@ app.post('/platform/projects/:ref/functions/deploy', async (c) => {
   }
 
   const files: FunctionFile[] = []
+  let totalBytes = 0
   for (const entry of form.getAll('file')) {
     if (typeof entry === 'string') continue
-    files.push({ name: entry.name, content: await entry.text() })
+    if (files.length >= MAX_FUNCTION_FILES) {
+      return c.json({ message: `a function may not have more than ${MAX_FUNCTION_FILES} files` }, 413)
+    }
+    const content = await entry.text()
+    totalBytes += Buffer.byteLength(content, 'utf8')
+    if (totalBytes > MAX_FUNCTION_BYTES) {
+      return c.json({ message: 'function bundle is too large' }, 413)
+    }
+    files.push({ name: entry.name, content })
   }
   if (files.length === 0) return c.json({ message: 'at least one file is required' }, 400)
 
@@ -278,6 +325,7 @@ app.post('/platform/projects/:ref/functions/deploy', async (c) => {
     entrypoint_path: metadata.entrypoint_path ?? null,
     import_map_path: metadata.import_map_path ?? null,
   })
+  await syncFunctionManifest()
   return c.json(functionResponse(fn))
 })
 
@@ -291,6 +339,7 @@ app.patch('/platform/projects/:ref/functions/:slug', async (c) => {
   const payload = await c.req.json<{ name?: string; verify_jwt?: boolean }>()
   const fn = await updateEdgeFunction(c.req.param('slug'), payload)
   if (!fn) return c.json({ message: 'function not found' }, 404)
+  await syncFunctionManifest()
   return c.json(functionResponse(fn))
 })
 
@@ -299,6 +348,7 @@ app.delete('/platform/projects/:ref/functions/:slug', async (c) => {
   if (!isValidSlug(slug)) return c.json({ message: `invalid function slug: ${slug}` }, 400)
   await deleteFunctionFiles(env.functionsDir, slug)
   await deleteEdgeFunction(slug)
+  await syncFunctionManifest()
   return c.json({ slug })
 })
 
@@ -333,6 +383,27 @@ app.get('/platform/projects/:ref/secrets', async (c) => {
 
 const SECRET_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/
 
+/**
+ * Names the edge runtime relies on. Managed secrets are merged over the
+ * runtime's own environment, so allowing these would let a secret repoint
+ * functions at another database or forge the stack's tokens.
+ */
+const RESERVED_SECRET_NAMES = new Set([
+  'SUPABASE_URL',
+  'SUPABASE_ANON_KEY',
+  'SUPABASE_SERVICE_ROLE_KEY',
+  'SUPABASE_PUBLISHABLE_KEY',
+  'SUPABASE_SECRET_KEY',
+  'SUPABASE_DB_URL',
+  'SUPABASE_JWKS',
+  'SUPABASE_FUNCTION_SLUG',
+  'JWT_SECRET',
+  'VERIFY_JWT',
+  'PATH',
+  'LD_PRELOAD',
+  'NODE_OPTIONS',
+])
+
 app.post('/platform/projects/:ref/secrets', async (c) => {
   const payload = await c.req.json<Array<{ name?: string; value?: string }>>()
   if (!Array.isArray(payload)) {
@@ -347,6 +418,9 @@ app.post('/platform/projects/:ref/secrets', async (c) => {
       !SECRET_NAME_RE.test(entry.name)
     ) {
       return c.json({ message: 'each secret needs a valid `name` and a string `value`' }, 400)
+    }
+    if (RESERVED_SECRET_NAMES.has(entry.name)) {
+      return c.json({ message: `${entry.name} is reserved by the runtime` }, 400)
     }
     secrets.push({ name: entry.name, value: entry.value })
   }
@@ -436,6 +510,14 @@ app.get('/dashboard-auth/login', (c) => {
 })
 
 app.post('/dashboard-auth/login', async (c) => {
+  const clientKey =
+    c.req.header('x-forwarded-for')?.split(',')[0].trim() ||
+    c.req.header('x-envoy-external-address') ||
+    'unknown'
+  if (isLoginRateLimited(clientKey)) {
+    return c.json({ message: 'Too many sign in attempts, try again later' }, 429)
+  }
+
   const payload = await c.req.json<{ username?: string; password?: string }>().catch(() => null)
   const username = payload?.username ?? ''
   const password = payload?.password ?? ''
@@ -444,15 +526,13 @@ app.post('/dashboard-auth/login', async (c) => {
     return c.json({ message: 'Invalid username or password' }, 401)
   }
 
-  c.header(
-    'Set-Cookie',
-    `${SESSION_COOKIE}=${createSessionToken()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800`
-  )
+  resetLoginRateLimit(clientKey)
+  c.header('Set-Cookie', sessionCookie(createSessionToken()))
   return c.json({ message: 'ok' })
 })
 
 app.post('/dashboard-auth/logout', (c) => {
-  c.header('Set-Cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`)
+  c.header('Set-Cookie', sessionCookie(null))
   return c.json({ message: 'ok' })
 })
 
@@ -527,6 +607,10 @@ async function main() {
   await migrate()
   await migrateThirdPartyAuth()
   await syncEnvFile()
+  // PostgREST reads its trusted key set from a file this service owns, so it
+  // has to exist (with the stack's own keys) before PostgREST starts.
+  await syncThirdPartyJwks()
+  if (env.functionsDir) await syncFunctionManifest()
   serve({ fetch: app.fetch, port: env.port }, (info) => {
     console.log(`management-api listening on :${info.port}`)
   })

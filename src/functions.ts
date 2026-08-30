@@ -71,7 +71,28 @@ export async function writeSecretsFile(
 ): Promise<void> {
   const target = path.join(functionsDir, SECRETS_FILE)
   const tmp = `${target}.tmp`
-  await writeFile(tmp, `${JSON.stringify(secrets, null, 2)}\n`, 'utf8')
+  // The volume is shared with edge-runtime, so the file is only readable by
+  // the user both services run as.
+  await writeFile(tmp, `${JSON.stringify(secrets, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+  await rename(tmp, target)
+}
+
+const MANIFEST_FILE = '.functions.json'
+
+/**
+ * Publishes per-function settings for the `main` dispatcher, which cannot read
+ * the database. Currently only `verify_jwt`, so JWT verification can be turned
+ * off for a single function instead of the whole runtime.
+ */
+export async function writeManifestFile(
+  functionsDir: string,
+  functions: Array<{ slug: string; verify_jwt: boolean }>
+): Promise<void> {
+  const manifest: Record<string, { verify_jwt: boolean }> = {}
+  for (const fn of functions) manifest[fn.slug] = { verify_jwt: fn.verify_jwt }
+  const target = path.join(functionsDir, MANIFEST_FILE)
+  const tmp = `${target}.tmp`
+  await writeFile(tmp, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
   await rename(tmp, target)
 }
 

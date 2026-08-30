@@ -50,7 +50,7 @@ async function encryptLegacyPlaintextRows(): Promise<void> {
     if (!isEncrypted(row.value)) {
       await pool.query(
         'update management.function_secrets set value = $2 where name = $1',
-        [row.name, encryptString(row.value)]
+        [row.name, encryptString(row.value, row.name)]
       )
     }
   }
@@ -62,7 +62,7 @@ async function encryptLegacyPlaintextRows(): Promise<void> {
     if (typeof value === 'string' && isEncrypted(value)) continue
     await pool.query('update management.auth_config set value = $2::jsonb where key = $1', [
       row.key,
-      JSON.stringify(encryptString(JSON.stringify(value))),
+      JSON.stringify(encryptString(JSON.stringify(value), row.key)),
     ])
   }
 }
@@ -137,7 +137,10 @@ export type FunctionSecret = { name: string; value: string; updated_at: Date }
 
 export async function getFunctionSecrets(): Promise<FunctionSecret[]> {
   const { rows } = await pool.query('select * from management.function_secrets order by name')
-  return rows.map((row) => ({ ...row, value: decryptString(row.value) }))
+  return rows.map((row) => ({
+    ...row,
+    value: isEncrypted(row.value) ? decryptString(row.value, row.name) : row.value,
+  }))
 }
 
 export async function upsertFunctionSecrets(
@@ -151,7 +154,7 @@ export async function upsertFunctionSecrets(
       await client.query(
         `insert into management.function_secrets (name, value) values ($1, $2)
          on conflict (name) do update set value = excluded.value, updated_at = now()`,
-        [secret.name, encryptString(secret.value)]
+        [secret.name, encryptString(secret.value, secret.name)]
       )
     }
     await client.query('commit')
@@ -173,8 +176,11 @@ export async function getAllConfig(): Promise<Record<string, ConfigValue>> {
   const out: Record<string, ConfigValue> = {}
   for (const row of rows) {
     const value = row.value
-    if (typeof value === 'string' && isEncrypted(value)) {
-      out[row.key] = JSON.parse(decryptString(value))
+    // Only values stored under sensitive keys are encrypted, so a plain string
+    // that merely looks like a ciphertext under any other key is passed through
+    // untouched instead of failing the whole read.
+    if (isSensitiveConfigKey(row.key) && typeof value === 'string' && isEncrypted(value)) {
+      out[row.key] = JSON.parse(decryptString(value, row.key))
     } else {
       out[row.key] = value
     }
@@ -194,7 +200,7 @@ export async function upsertConfig(entries: Record<string, ConfigValue>): Promis
         await client.query('delete from management.auth_config where key = $1', [key])
       } else {
         const serialized = isSensitiveConfigKey(key)
-          ? JSON.stringify(encryptString(JSON.stringify(value)))
+          ? JSON.stringify(encryptString(JSON.stringify(value), key))
           : JSON.stringify(value)
         await client.query(
           `insert into management.auth_config (key, value) values ($1, $2::jsonb)
