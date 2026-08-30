@@ -703,7 +703,15 @@ app.post('/dashboard-auth/accept-invitation', async (c) => {
   }
   resetLoginRateLimit(clientKey)
   c.header('Set-Cookie', sessionCookie(createSessionToken({ username: result.username, role: result.role })))
-  return c.json({ username: result.username, role: result.role }, 201)
+  const [organization] = await listOrganizations()
+  return c.json(
+    {
+      username: result.username,
+      role: result.role,
+      organization_slug: organization?.slug ?? null,
+    },
+    201
+  )
 })
 
 app.post('/dashboard-auth/logout', (c) => {
