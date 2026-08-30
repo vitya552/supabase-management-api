@@ -38,6 +38,8 @@ export async function migrateDashboardUsers(): Promise<void> {
       consumed_at timestamptz,
       inserted_at timestamptz not null default now()
     );
+    alter table management.dashboard_invitations
+      add column if not exists invited_email text not null default '';
   `)
 }
 
@@ -100,10 +102,35 @@ export async function deleteDashboardUser(
   return { deleted: (rowCount ?? 0) > 0, lastOwner: false }
 }
 
+export async function updateDashboardUserRole(
+  username: string,
+  role: DashboardRole
+): Promise<{ updated: boolean; lastOwner: boolean }> {
+  // Demoting the last remaining owner would leave the dashboard without an
+  // account able to manage users, so it is refused like deletion is.
+  const { rows } = await pool.query(
+    `select role,
+            (select count(*) from management.dashboard_users where role = 'owner') as owner_count
+     from management.dashboard_users where username = $1`,
+    [username]
+  )
+  const target = rows[0]
+  if (!target) return { updated: false, lastOwner: false }
+  if (target.role === 'owner' && role !== 'owner' && Number(target.owner_count) <= 1) {
+    return { updated: false, lastOwner: true }
+  }
+  const { rowCount } = await pool.query(
+    'update management.dashboard_users set role = $2 where username = $1',
+    [username, role]
+  )
+  return { updated: (rowCount ?? 0) > 0, lastOwner: false }
+}
+
 export type DashboardInvitation = {
   id: number
   role: DashboardRole
   invited_by: string
+  invited_email: string
   expires_at: Date
   consumed_at: Date | null
   inserted_at: Date
@@ -119,21 +146,30 @@ function hashInvitationToken(token: string): string {
 export async function createInvitation(input: {
   role: DashboardRole
   invitedBy: string
+  invitedEmail?: string
 }): Promise<{ invitation: DashboardInvitation; token: string }> {
   const token = randomBytes(32).toString('base64url')
   const { rows } = await pool.query(
-    `insert into management.dashboard_invitations (token_hash, role, invited_by, expires_at)
-     values ($1, $2, $3, $4)
-     returning id, role, invited_by, expires_at, consumed_at, inserted_at`,
-    [hashInvitationToken(token), input.role, input.invitedBy, new Date(Date.now() + INVITATION_TTL_MS)]
+    `insert into management.dashboard_invitations (token_hash, role, invited_by, invited_email, expires_at)
+     values ($1, $2, $3, $4, $5)
+     returning id, role, invited_by, invited_email, expires_at, consumed_at, inserted_at`,
+    [
+      hashInvitationToken(token),
+      input.role,
+      input.invitedBy,
+      input.invitedEmail ?? '',
+      new Date(Date.now() + INVITATION_TTL_MS),
+    ]
   )
   return { invitation: rows[0], token }
 }
 
 export async function listInvitations(): Promise<DashboardInvitation[]> {
   const { rows } = await pool.query(
-    `select id, role, invited_by, expires_at, consumed_at, inserted_at
-     from management.dashboard_invitations order by id desc`
+    `select id, role, invited_by, invited_email, expires_at, consumed_at, inserted_at
+     from management.dashboard_invitations
+     where consumed_at is null and expires_at > now()
+     order by id desc`
   )
   return rows
 }

@@ -31,6 +31,7 @@ import {
   listDashboardUsers,
   listInvitations,
   migrateDashboardUsers,
+  updateDashboardUserRole,
   verifyDashboardUser,
 } from './dashboard-users.js'
 import { renderReactEmail } from './emails.js'
@@ -903,6 +904,23 @@ app.post('/platform/dashboard-users', async (c) => {
   }
 })
 
+app.patch('/platform/dashboard-users/:username', async (c) => {
+  if (!canAdminister(c)) {
+    return c.json({ message: 'only owners and admins can manage users' }, 403)
+  }
+  const payload = await c.req.json<{ role?: string }>().catch(() => null)
+  const role = payload?.role
+  if (!role || !DASHBOARD_ROLES.has(role)) {
+    return c.json({ message: 'role must be owner, admin or developer' }, 400)
+  }
+  const result = await updateDashboardUserRole(c.req.param('username'), role as DashboardRole)
+  if (result.lastOwner) {
+    return c.json({ message: 'the last owner cannot be demoted' }, 400)
+  }
+  if (!result.updated) return c.json({ message: 'user not found' }, 404)
+  return c.json({})
+})
+
 app.delete('/platform/dashboard-users/:username', async (c) => {
   if (!canAdminister(c)) {
     return c.json({ message: 'only owners and admins can manage users' }, 403)
@@ -923,15 +941,23 @@ app.post('/platform/dashboard-users/invitations', async (c) => {
   if (!canAdminister(c)) {
     return c.json({ message: 'only owners and admins can invite users' }, 403)
   }
-  const payload = await c.req.json<{ role?: string }>().catch(() => null)
+  const payload = await c
+    .req
+    .json<{ role?: string; invited_email?: string }>()
+    .catch(() => null)
   const role = payload?.role ?? 'developer'
   if (!DASHBOARD_ROLES.has(role)) {
     return c.json({ message: 'role must be owner, admin or developer' }, 400)
+  }
+  const invitedEmail = typeof payload?.invited_email === 'string' ? payload.invited_email : ''
+  if (invitedEmail.length > 320) {
+    return c.json({ message: 'invited_email is too long' }, 400)
   }
   const identity = requestIdentity(c)
   const { invitation, token } = await createInvitation({
     role: role as DashboardRole,
     invitedBy: identity?.username ?? 'service',
+    invitedEmail,
   })
   // The raw token is only returned here, once; the DB stores its hash.
   return c.json({ ...invitation, token }, 201)
