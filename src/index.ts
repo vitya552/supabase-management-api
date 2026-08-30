@@ -8,7 +8,9 @@ import { AUTH_CONFIG_KEYS } from './auth-config-keys.js'
 import { baselineConfig } from './baseline.js'
 import {
   createSessionToken,
+  type DashboardSessionIdentity,
   getCookie,
+  getSessionIdentity,
   isLoginRateLimited,
   isValidBasicAuthHeader,
   isValidCredentials,
@@ -19,11 +21,15 @@ import {
   SESSION_COOKIE,
 } from './dashboard-auth.js'
 import {
+  acceptInvitation,
   createDashboardUser,
+  createInvitation,
   DASHBOARD_ROLES,
   type DashboardRole,
   deleteDashboardUser,
+  deleteInvitation,
   listDashboardUsers,
+  listInvitations,
   migrateDashboardUsers,
   verifyDashboardUser,
 } from './dashboard-users.js'
@@ -122,6 +128,27 @@ app.use('/platform/*', async (c, next) => {
   }
   await next()
 })
+
+/**
+ * Dashboard identity of the request, taken from the forwarded session cookie
+ * (Studio forwards it on proxied calls). Requests without a session cookie
+ * are direct token-authenticated API calls and act with full (owner) rights.
+ */
+function requestIdentity(c: {
+  req: { header: (name: string) => string | undefined }
+}): DashboardSessionIdentity | null {
+  const token = getCookie(c.req.header('cookie') ?? '', SESSION_COOKIE)
+  if (!token) return null
+  return getSessionIdentity(token)
+}
+
+/** True when the request may perform owner/admin-only actions. */
+function canAdminister(c: {
+  req: { header: (name: string) => string | undefined }
+}): boolean {
+  const identity = requestIdentity(c)
+  return identity === null || identity.role === 'owner' || identity.role === 'admin'
+}
 
 function validateConfigPayload(payload: Record<string, unknown>): {
   valid: Record<string, ConfigValue>
@@ -555,16 +582,64 @@ app.post('/dashboard-auth/login', async (c) => {
 
   // Env credentials remain the break-glass owner login; additional users
   // live in the database (managed via /platform/dashboard-users).
-  if (!isValidCredentials(username, password)) {
-    const user = username && password ? await verifyDashboardUser(username, password) : null
-    if (!user) {
-      return c.json({ message: 'Invalid username or password' }, 401)
-    }
+  let identity: DashboardSessionIdentity | null = null
+  if (isValidCredentials(username, password)) {
+    identity = { username, role: 'owner' }
+  } else if (username && password) {
+    const user = await verifyDashboardUser(username, password)
+    if (user) identity = { username: user.username, role: user.role }
+  }
+  if (identity === null) {
+    return c.json({ message: 'Invalid username or password' }, 401)
   }
 
   resetLoginRateLimit(clientKey)
-  c.header('Set-Cookie', sessionCookie(createSessionToken()))
+  c.header('Set-Cookie', sessionCookie(createSessionToken(identity)))
   return c.json({ message: 'ok' })
+})
+
+// Accepts a one-time invitation and creates the dashboard account. Only
+// needs the invitation token, so it lives next to login (no session yet).
+app.post('/dashboard-auth/accept-invitation', async (c) => {
+  const forwardedFor = c.req.header('x-forwarded-for')?.split(',') ?? []
+  const clientKey =
+    c.req.header('x-envoy-external-address') || forwardedFor.at(-1)?.trim() || 'unknown'
+  if (isLoginRateLimited(clientKey)) {
+    return c.json({ message: 'Too many attempts, try again later' }, 429)
+  }
+
+  const payload = await c
+    .req
+    .json<{ token?: string; username?: string; password?: string }>()
+    .catch(() => null)
+  if (!payload?.token || typeof payload.token !== 'string') {
+    return c.json({ message: 'body must contain an invitation `token`' }, 400)
+  }
+  if (
+    !payload.username ||
+    typeof payload.username !== 'string' ||
+    !/^[A-Za-z0-9_.@-]{3,64}$/.test(payload.username)
+  ) {
+    return c.json({ message: 'username must be 3-64 chars (letters, digits, _.@-)' }, 400)
+  }
+  if (!payload.password || typeof payload.password !== 'string' || payload.password.length < 8) {
+    return c.json({ message: 'password must be at least 8 characters' }, 400)
+  }
+
+  const result = await acceptInvitation({
+    token: payload.token,
+    username: payload.username,
+    password: payload.password,
+  })
+  if (result === 'invalid_token') {
+    return c.json({ message: 'invitation is invalid, expired or already used' }, 400)
+  }
+  if (result === 'username_taken') {
+    return c.json({ message: 'username already exists' }, 409)
+  }
+  resetLoginRateLimit(clientKey)
+  c.header('Set-Cookie', sessionCookie(createSessionToken({ username: result.username, role: result.role })))
+  return c.json({ username: result.username, role: result.role }, 201)
 })
 
 app.post('/dashboard-auth/logout', (c) => {
@@ -650,6 +725,9 @@ app.get('/platform/projects', async (c) => {
 })
 
 app.post('/platform/projects', async (c) => {
+  if (!canAdminister(c)) {
+    return c.json({ message: 'only owners and admins can create projects' }, 403)
+  }
   const payload = await c
     .req
     .json<{
@@ -736,6 +814,9 @@ app.get('/platform/projects/:ref/api-keys', async (c) => {
 })
 
 app.delete('/platform/projects/:ref', async (c) => {
+  if (!canAdminister(c)) {
+    return c.json({ message: 'only owners and admins can delete projects' }, 403)
+  }
   const ref = c.req.param('ref')
   const project = await getProject(ref)
   if (!project) return c.json({ message: 'project not found' }, 404)
@@ -756,7 +837,16 @@ app.get('/platform/dashboard-users', async (c) => {
   return c.json(await listDashboardUsers())
 })
 
+// The caller's own identity/role, for role-aware UI.
+app.get('/platform/profile', (c) => {
+  const identity = requestIdentity(c)
+  return c.json(identity ?? { username: 'service', role: 'owner' })
+})
+
 app.post('/platform/dashboard-users', async (c) => {
+  if (!canAdminister(c)) {
+    return c.json({ message: 'only owners and admins can manage users' }, 403)
+  }
   const payload = await c
     .req
     .json<{ username?: string; password?: string; role?: string }>()
@@ -788,8 +878,47 @@ app.post('/platform/dashboard-users', async (c) => {
 })
 
 app.delete('/platform/dashboard-users/:username', async (c) => {
-  const deleted = await deleteDashboardUser(c.req.param('username'))
-  if (!deleted) return c.json({ message: 'user not found' }, 404)
+  if (!canAdminister(c)) {
+    return c.json({ message: 'only owners and admins can manage users' }, 403)
+  }
+  const result = await deleteDashboardUser(c.req.param('username'))
+  if (result.lastOwner) {
+    return c.json({ message: 'the last owner cannot be deleted' }, 400)
+  }
+  if (!result.deleted) return c.json({ message: 'user not found' }, 404)
+  return c.json({})
+})
+
+app.get('/platform/dashboard-users/invitations', async (c) => {
+  return c.json(await listInvitations())
+})
+
+app.post('/platform/dashboard-users/invitations', async (c) => {
+  if (!canAdminister(c)) {
+    return c.json({ message: 'only owners and admins can invite users' }, 403)
+  }
+  const payload = await c.req.json<{ role?: string }>().catch(() => null)
+  const role = payload?.role ?? 'developer'
+  if (!DASHBOARD_ROLES.has(role)) {
+    return c.json({ message: 'role must be owner, admin or developer' }, 400)
+  }
+  const identity = requestIdentity(c)
+  const { invitation, token } = await createInvitation({
+    role: role as DashboardRole,
+    invitedBy: identity?.username ?? 'service',
+  })
+  // The raw token is only returned here, once; the DB stores its hash.
+  return c.json({ ...invitation, token }, 201)
+})
+
+app.delete('/platform/dashboard-users/invitations/:id', async (c) => {
+  if (!canAdminister(c)) {
+    return c.json({ message: 'only owners and admins can manage invitations' }, 403)
+  }
+  const id = Number(c.req.param('id'))
+  if (!Number.isInteger(id)) return c.json({ message: 'invalid invitation id' }, 400)
+  const deleted = await deleteInvitation(id)
+  if (!deleted) return c.json({ message: 'invitation not found' }, 404)
   return c.json({})
 })
 

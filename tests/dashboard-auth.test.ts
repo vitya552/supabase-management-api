@@ -10,27 +10,40 @@ process.env.DASHBOARD_PASSWORD = 'test-password'
 const {
   createSessionToken,
   getCookie,
+  getSessionIdentity,
   isValidBasicAuthHeader,
   isValidCredentials,
   isValidSessionToken,
   sanitizeRedirectPath,
 } = await import('../src/dashboard-auth.js')
 
+const OWNER = { username: 'admin', role: 'owner' as const }
+
 describe('session tokens', () => {
   it('round-trips a freshly created token', () => {
-    const token = createSessionToken()
+    const token = createSessionToken(OWNER)
     assert.equal(isValidSessionToken(token), true)
+    assert.deepEqual(getSessionIdentity(token), OWNER)
+  })
+
+  it('carries the user role', () => {
+    const token = createSessionToken({ username: 'dev', role: 'developer' })
+    assert.deepEqual(getSessionIdentity(token), { username: 'dev', role: 'developer' })
   })
 
   it('rejects expired tokens', () => {
-    const token = createSessionToken(Date.now() - 9 * 60 * 60 * 1000)
+    const token = createSessionToken(OWNER, Date.now() - 9 * 60 * 60 * 1000)
     assert.equal(isValidSessionToken(token), false)
   })
 
   it('rejects tampered tokens', () => {
-    const token = createSessionToken()
-    const [expiresAt, signature] = token.split('.')
-    assert.equal(isValidSessionToken(`${Number(expiresAt) + 60}.${signature}`), false)
+    const token = createSessionToken(OWNER)
+    const [, payload, signature] = token.split('.')
+    const forged = Buffer.from(
+      JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600, sub: 'evil', role: 'owner' })
+    ).toString('base64url')
+    assert.equal(isValidSessionToken(`v2.${forged}.${signature}`), false)
+    assert.equal(isValidSessionToken(`v2.${payload}.deadbeef`), false)
     assert.equal(isValidSessionToken('garbage'), false)
     assert.equal(isValidSessionToken(''), false)
   })
