@@ -741,15 +741,38 @@ function projectResponse(project: ProjectRecord) {
         : null,
     database:
       project.kind === 'compose' && project.secrets
-        ? {
-            host: `sbproj-${project.ref}-db`,
-            port: 5432,
-            user: 'postgres',
-            name: 'postgres',
-          }
+        ? composeDatabaseMetadata(project)
         : project.kind === 'external' && project.external_db_url
           ? externalDatabaseMetadata(project.external_db_url)
           : null,
+  }
+}
+
+/** Externally reachable Postgres endpoint for a compose project: the
+ * deployment's public host plus the project's published port. Projects
+ * created before port publishing fall back to the docker-network name. */
+function composeDatabaseMetadata(project: ProjectRecord) {
+  if (project.db_port === null) {
+    return {
+      host: `sbproj-${project.ref}-db`,
+      port: 5432,
+      user: 'postgres',
+      name: 'postgres',
+    }
+  }
+  return {
+    host: publicHostname(),
+    port: project.db_port,
+    user: 'postgres',
+    name: 'postgres',
+  }
+}
+
+function publicHostname(): string {
+  try {
+    return new URL(env.publicUrl).hostname
+  } catch {
+    return 'localhost'
   }
 }
 

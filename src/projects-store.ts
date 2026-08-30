@@ -28,6 +28,8 @@ export type ProjectRecord = {
   status: ProjectStatus
   /** External projects only: full Postgres connection string. */
   external_db_url: string | null
+  /** Compose projects only: host port published for the project's Postgres. */
+  db_port: number | null
   secrets: ProjectSecrets | null
   status_detail: string | null
   inserted_at: Date
@@ -74,6 +76,8 @@ export async function migrateProjects(): Promise<void> {
       (select greatest(max(id), 1) from management.projects));
     alter table management.organizations
       add column if not exists opt_in_tags jsonb not null default '[]'::jsonb;
+    alter table management.projects
+      add column if not exists db_port int;
   `)
 }
 
@@ -88,6 +92,7 @@ function rowToProject(row: {
   kind: ProjectKind
   status: ProjectStatus
   external_db_url: string | null
+  db_port: number | null
   secrets: string | null
   status_detail: string | null
   inserted_at: Date
@@ -127,13 +132,14 @@ export async function createProjectRecord(input: {
   organizationId: number
   kind: 'compose' | 'external'
   externalDbUrl?: string
+  dbPort?: number
   secrets?: ProjectSecrets
   status: ProjectStatus
 }): Promise<ProjectRecord> {
   const { rows } = await pool.query(
     `insert into management.projects
-       (ref, name, organization_id, kind, status, external_db_url, secrets)
-     values ($1, $2, $3, $4, $5, $6, $7::jsonb)
+       (ref, name, organization_id, kind, status, external_db_url, db_port, secrets)
+     values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
      returning *`,
     [
       input.ref,
@@ -142,12 +148,22 @@ export async function createProjectRecord(input: {
       input.kind,
       input.status,
       input.externalDbUrl ? encryptString(input.externalDbUrl, EXTERNAL_DB_CONTEXT) : null,
+      input.dbPort ?? null,
       input.secrets
         ? JSON.stringify(encryptString(JSON.stringify(input.secrets), SECRET_CONTEXT))
         : null,
     ]
   )
   return rowToProject(rows[0])
+}
+
+/** First free published Postgres port for a new compose project. Ports start
+ * right after the pooler's 5432/6543 range used by the default stack. */
+export async function allocateDbPort(): Promise<number> {
+  const { rows } = await pool.query(
+    'select coalesce(max(db_port), 54329) + 1 as next from management.projects'
+  )
+  return Number(rows[0].next)
 }
 
 export async function updateProjectStatus(

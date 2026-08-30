@@ -7,6 +7,7 @@ import { promisify } from 'node:util'
 import { env } from './env.js'
 import { mintApiKey } from './jwt.js'
 import {
+  allocateDbPort,
   createProjectRecord,
   deleteProjectRecord,
   generateRef,
@@ -67,7 +68,7 @@ async function compose(ref: string, args: string[]): Promise<void> {
   )
 }
 
-function composeFile(ref: string): string {
+function composeFile(ref: string, dbPort: number): string {
   const dir = hostDir(ref)
   const name = (service: string) => containerName(ref, service)
   // All services join the main stack's network so the gateway proxy
@@ -90,6 +91,8 @@ services:
     container_name: ${name('db')}
     image: ${env.projectImages.postgres}
     restart: unless-stopped
+    ports:
+      - "${dbPort}:5432"
     volumes:
       - ${dir}/db-init/realtime.sql:/docker-entrypoint-initdb.d/migrations/99-realtime.sql:Z
       - ${dir}/db-init/webhooks.sql:/docker-entrypoint-initdb.d/init-scripts/98-webhooks.sql:Z
@@ -249,7 +252,7 @@ const DB_INIT_FILES = [
   'pooler.sql',
 ]
 
-async function writeProjectFiles(ref: string, secrets: ProjectSecrets): Promise<void> {
+async function writeProjectFiles(ref: string, secrets: ProjectSecrets, dbPort: number): Promise<void> {
   const dir = projectDir(ref)
   await mkdir(path.join(dir, 'db-init'), { recursive: true })
   await mkdir(path.join(dir, 'db-data'), { recursive: true })
@@ -265,7 +268,7 @@ async function writeProjectFiles(ref: string, secrets: ProjectSecrets): Promise<
   await cp(mainDispatcher, path.join(dir, 'functions', 'main'), { recursive: true })
 
   await writeFile(path.join(dir, '.env'), envFile(ref, secrets), { mode: 0o600 })
-  await writeFile(path.join(dir, 'docker-compose.yml'), composeFile(ref))
+  await writeFile(path.join(dir, 'docker-compose.yml'), composeFile(ref, dbPort))
 }
 
 export function generateProjectSecrets(): ProjectSecrets {
@@ -288,18 +291,20 @@ export async function provisionProject(input: {
 }): Promise<ProjectRecord> {
   const ref = generateRef()
   const secrets = generateProjectSecrets()
+  const dbPort = await allocateDbPort()
   const record = await createProjectRecord({
     ref,
     name: input.name,
     organizationId: input.organizationId,
     kind: 'compose',
+    dbPort,
     secrets,
     status: 'COMING_UP',
   })
 
   void (async () => {
     try {
-      await writeProjectFiles(ref, secrets)
+      await writeProjectFiles(ref, secrets, dbPort)
       await compose(ref, ['--env-file', path.join(projectDir(ref), '.env'), 'up', '-d'])
       await updateProjectStatus(ref, 'ACTIVE_HEALTHY')
     } catch (err) {
