@@ -39,6 +39,7 @@ import {
 } from './dashboard-users.js'
 import { renderReactEmail } from './emails.js'
 import { defaultAuthConfig } from './gotrue-defaults.js'
+import { defaultReactEmailSource } from './react-email-defaults.js'
 import { env } from './env.js'
 import { syncEnvFile, templateTypeFromConfigKey } from './envfile.js'
 import {
@@ -231,7 +232,20 @@ async function applyConfigPatch(payload: Record<string, unknown>) {
 }
 
 async function currentConfig() {
-  return { ...defaultAuthConfig(), ...baselineConfig(), ...(await getAllConfig()) }
+  const stored = await getAllConfig()
+  const templatesCustom: Record<string, boolean> = {}
+  const subjectsCustom: Record<string, boolean> = {}
+  for (const key of Object.keys(stored)) {
+    if (/^MAILER_TEMPLATES_.+_CONTENT$/.test(key)) templatesCustom[key] = true
+    else if (key.startsWith('MAILER_SUBJECTS_')) subjectsCustom[key] = true
+  }
+  return {
+    ...defaultAuthConfig(),
+    ...baselineConfig(),
+    ...stored,
+    MAILER_TEMPLATES_CUSTOM_CONTENTS: templatesCustom,
+    MAILER_SUBJECTS_CUSTOM_CONTENTS: subjectsCustom,
+  }
 }
 
 app.get('/platform/auth/:ref/config', async (c) => {
@@ -316,10 +330,18 @@ app.get('/platform/auth/:ref/templates/:template/react', async (c) => {
   const type = templateParam(c)
   if (!type) return c.json({ message: 'unknown template type' }, 400)
   const template = await getEmailTemplate(type)
-  if (!template || template.source_format !== 'react') {
-    return c.json({ message: 'react template not found' }, 404)
+  if (template && template.source_format === 'react') {
+    return c.json({ ...template, is_default: false })
   }
-  return c.json(template)
+  const source = defaultReactEmailSource(type)
+  if (!source) return c.json({ message: 'react template not found' }, 404)
+  return c.json({
+    template_type: type,
+    source,
+    source_format: 'react',
+    rendered_html: null,
+    is_default: true,
+  })
 })
 
 // -- Edge Functions -----------------------------------------------------

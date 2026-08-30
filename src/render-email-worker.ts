@@ -38,6 +38,11 @@ export const GOTRUE_TEMPLATE_PROPS = {
   newEmail: '{{ .NewEmail }}',
   redirectTo: '{{ .RedirectTo }}',
   data: '{{ .Data }}',
+  oldEmail: '{{ .OldEmail }}',
+  phone: '{{ .Phone }}',
+  oldPhone: '{{ .OldPhone }}',
+  provider: '{{ .Provider }}',
+  factorType: '{{ .FactorType }}',
 } as const
 
 export type GoTrueTemplateProps = Record<keyof typeof GOTRUE_TEMPLATE_PROPS, string>
