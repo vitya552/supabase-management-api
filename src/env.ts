@@ -79,4 +79,28 @@ export const env = {
    * VAULT_ENC_KEY so the standard self-hosted .env works out of the box.
    */
   encryptionKey: process.env.MANAGEMENT_ENC_KEY || required('VAULT_ENC_KEY'),
+
+  /**
+   * Multi-project provisioning. PROJECTS_DIR is where project stacks are
+   * materialized inside this container; PROJECTS_HOST_DIR is the same
+   * directory as seen by the host docker daemon (needed because generated
+   * compose files bind-mount host paths). Unset disables provisioning.
+   */
+  projectsDir: process.env.PROJECTS_DIR ?? '',
+  projectsHostDir: process.env.PROJECTS_HOST_DIR ?? '',
+
+  /** Copy source for per-project database init scripts (volumes/db). */
+  dbInitDir: process.env.DB_INIT_DIR ?? '/mnt/db-init',
+
+  /** Docker network shared with the main stack, joined by project stacks. */
+  mainNetworkName: process.env.MAIN_NETWORK_NAME ?? 'supabase_default',
+
+  /** Images used for per-project stacks; keep in sync with docker-compose.yml. */
+  projectImages: {
+    postgres: process.env.PROJECT_POSTGRES_IMAGE ?? 'supabase/postgres:17.6.1.136',
+    postgrest: process.env.PROJECT_POSTGREST_IMAGE ?? 'postgrest/postgrest:v14.12',
+    gotrue: process.env.PROJECT_GOTRUE_IMAGE ?? 'supabase/gotrue:v2.189.0',
+    storage: process.env.PROJECT_STORAGE_IMAGE ?? 'supabase/storage-api:v1.60.4',
+    edgeRuntime: process.env.PROJECT_EDGE_RUNTIME_IMAGE ?? 'supabase/edge-runtime:v1.74.0',
+  },
 }

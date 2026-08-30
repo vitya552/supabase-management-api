@@ -2,6 +2,7 @@ import { serve } from '@hono/node-server'
 import { Hono } from 'hono'
 import { logger } from 'hono/logger'
 import { createHash, timingSafeEqual } from 'node:crypto'
+import pg from 'pg'
 
 import { AUTH_CONFIG_KEYS } from './auth-config-keys.js'
 import { baselineConfig } from './baseline.js'
@@ -17,6 +18,15 @@ import {
   sessionCookie,
   SESSION_COOKIE,
 } from './dashboard-auth.js'
+import {
+  createDashboardUser,
+  DASHBOARD_ROLES,
+  type DashboardRole,
+  deleteDashboardUser,
+  listDashboardUsers,
+  migrateDashboardUsers,
+  verifyDashboardUser,
+} from './dashboard-users.js'
 import { renderReactEmail } from './emails.js'
 import { defaultAuthConfig } from './gotrue-defaults.js'
 import { env } from './env.js'
@@ -29,6 +39,23 @@ import {
   writeManifestFile,
   writeSecretsFile,
 } from './functions.js'
+import { proxyProjectRequest } from './project-proxy.js'
+import {
+  createOrganization,
+  createProjectRecord,
+  generateRef,
+  getProject,
+  listOrganizations,
+  listProjects,
+  migrateProjects,
+  type ProjectRecord,
+} from './projects-store.js'
+import {
+  deprovisionProject,
+  projectsConfigured,
+  provisionProject,
+  resumeProjects,
+} from './provisioner.js'
 import {
   getPostgresConfig,
   isManagedGuc,
@@ -526,8 +553,13 @@ app.post('/dashboard-auth/login', async (c) => {
   const username = payload?.username ?? ''
   const password = payload?.password ?? ''
 
+  // Env credentials remain the break-glass owner login; additional users
+  // live in the database (managed via /platform/dashboard-users).
   if (!isValidCredentials(username, password)) {
-    return c.json({ message: 'Invalid username or password' }, 401)
+    const user = username && password ? await verifyDashboardUser(username, password) : null
+    if (!user) {
+      return c.json({ message: 'Invalid username or password' }, 401)
+    }
   }
 
   resetLoginRateLimit(clientKey)
@@ -538,6 +570,183 @@ app.post('/dashboard-auth/login', async (c) => {
 app.post('/dashboard-auth/logout', (c) => {
   c.header('Set-Cookie', sessionCookie(null))
   return c.json({ message: 'ok' })
+})
+
+// -- Projects & organizations ---------------------------------------------
+
+function projectResponse(project: ProjectRecord) {
+  return {
+    id: project.id,
+    ref: project.ref,
+    name: project.name,
+    organization_id: project.organization_id,
+    kind: project.kind,
+    status: project.status,
+    status_detail: project.status_detail,
+    cloud_provider: 'localhost',
+    region: 'local',
+    inserted_at: new Date(project.inserted_at).toISOString(),
+    // Compose projects: services live in their own stack behind /proj/<ref>.
+    // External projects: only the database is managed.
+    endpoint:
+      project.kind === 'compose'
+        ? `${env.publicUrl.replace(/\/$/, '')}/proj/${project.ref}`
+        : null,
+    anon_key: project.secrets?.anon_key ?? null,
+    service_role_key: project.secrets?.service_role_key ?? null,
+    database:
+      project.kind === 'compose' && project.secrets
+        ? {
+            host: `sbproj-${project.ref}-db`,
+            port: 5432,
+            user: 'postgres',
+            name: 'postgres',
+            connection_string: `postgresql://postgres:${project.secrets.postgres_password}@sbproj-${project.ref}-db:5432/postgres`,
+          }
+        : project.kind === 'external' && project.external_db_url
+          ? { connection_string: project.external_db_url }
+          : null,
+  }
+}
+
+app.get('/platform/organizations', async (c) => {
+  return c.json(await listOrganizations())
+})
+
+app.post('/platform/organizations', async (c) => {
+  const payload = await c.req.json<{ name?: string }>().catch(() => null)
+  if (!payload?.name || typeof payload.name !== 'string') {
+    return c.json({ message: 'body must contain a `name` string' }, 400)
+  }
+  return c.json(await createOrganization(payload.name), 201)
+})
+
+app.get('/platform/projects', async (c) => {
+  return c.json((await listProjects()).map(projectResponse))
+})
+
+app.post('/platform/projects', async (c) => {
+  const payload = await c
+    .req
+    .json<{
+      name?: string
+      organization_id?: number
+      kind?: string
+      db_connection_string?: string
+    }>()
+    .catch(() => null)
+  if (!payload?.name || typeof payload.name !== 'string') {
+    return c.json({ message: 'body must contain a `name` string' }, 400)
+  }
+  const organizationId =
+    typeof payload.organization_id === 'number' ? payload.organization_id : 1
+  const kind = payload.kind ?? 'compose'
+
+  if (kind === 'external') {
+    const dbUrl = payload.db_connection_string
+    if (!dbUrl || typeof dbUrl !== 'string' || !/^postgres(ql)?:\/\//.test(dbUrl)) {
+      return c.json(
+        { message: 'external projects need a postgres:// `db_connection_string`' },
+        400
+      )
+    }
+    const probe = new pg.Client({
+      connectionString: dbUrl,
+      connectionTimeoutMillis: 10_000,
+    })
+    try {
+      await probe.connect()
+      await probe.query('select 1')
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return c.json({ message: `could not connect to database: ${message}` }, 400)
+    } finally {
+      await probe.end().catch(() => {})
+    }
+    const record = await createProjectRecord({
+      ref: generateRef(),
+      name: payload.name,
+      organizationId,
+      kind: 'external',
+      externalDbUrl: dbUrl,
+      status: 'ACTIVE_HEALTHY',
+    })
+    return c.json(projectResponse(record), 201)
+  }
+
+  if (kind !== 'compose') return c.json({ message: `unknown project kind: ${kind}` }, 400)
+  if (!projectsConfigured()) {
+    return c.json(
+      { message: 'project provisioning is not configured (PROJECTS_DIR / PROJECTS_HOST_DIR)' },
+      501
+    )
+  }
+  const record = await provisionProject({ name: payload.name, organizationId })
+  return c.json(projectResponse(record), 201)
+})
+
+app.get('/platform/projects/:ref', async (c) => {
+  const project = await getProject(c.req.param('ref'))
+  if (!project) return c.json({ message: 'project not found' }, 404)
+  return c.json(projectResponse(project))
+})
+
+app.delete('/platform/projects/:ref', async (c) => {
+  const ref = c.req.param('ref')
+  const project = await getProject(ref)
+  if (!project) return c.json({ message: 'project not found' }, 404)
+  if (project.kind === 'default') {
+    return c.json({ message: 'the default project cannot be deleted' }, 400)
+  }
+  await deprovisionProject(ref)
+  return c.json({ ref })
+})
+
+// Per-project API traffic (rest/auth/storage/functions), routed here by the
+// gateway. The project's own services authenticate each request.
+app.all('/proj/:ref/*', proxyProjectRequest)
+
+// -- Dashboard users (teams) ----------------------------------------------
+
+app.get('/platform/dashboard-users', async (c) => {
+  return c.json(await listDashboardUsers())
+})
+
+app.post('/platform/dashboard-users', async (c) => {
+  const payload = await c
+    .req
+    .json<{ username?: string; password?: string; role?: string }>()
+    .catch(() => null)
+  if (
+    !payload?.username ||
+    typeof payload.username !== 'string' ||
+    !/^[A-Za-z0-9_.@-]{3,64}$/.test(payload.username)
+  ) {
+    return c.json({ message: 'username must be 3-64 chars (letters, digits, _.@-)' }, 400)
+  }
+  if (!payload.password || typeof payload.password !== 'string' || payload.password.length < 8) {
+    return c.json({ message: 'password must be at least 8 characters' }, 400)
+  }
+  const role = payload.role ?? 'developer'
+  if (!DASHBOARD_ROLES.has(role)) {
+    return c.json({ message: 'role must be owner, admin or developer' }, 400)
+  }
+  try {
+    const user = await createDashboardUser({
+      username: payload.username,
+      password: payload.password,
+      role: role as DashboardRole,
+    })
+    return c.json(user, 201)
+  } catch {
+    return c.json({ message: 'username already exists' }, 409)
+  }
+})
+
+app.delete('/platform/dashboard-users/:username', async (c) => {
+  const deleted = await deleteDashboardUser(c.req.param('username'))
+  if (!deleted) return c.json({ message: 'user not found' }, 404)
+  return c.json({})
 })
 
 // -- PostgREST configuration --------------------------------------------
@@ -610,6 +819,8 @@ app.put('/platform/projects/:ref/config/database/postgres', async (c) => {
 async function main() {
   await migrate()
   await migrateThirdPartyAuth()
+  await migrateProjects()
+  await migrateDashboardUsers()
   await syncEnvFile()
   // PostgREST reads its trusted key set from a file this service owns, so it
   // has to exist (with the stack's own keys) before PostgREST starts.
@@ -618,6 +829,8 @@ async function main() {
   serve({ fetch: app.fetch, port: env.port }, (info) => {
     console.log(`management-api listening on :${info.port}`)
   })
+  // Bring project stacks back up after a host/daemon restart, in background.
+  void resumeProjects().catch((err) => console.error('resuming projects failed:', err))
 }
 
 main().catch((err) => {
