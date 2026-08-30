@@ -895,6 +895,9 @@ function classifyConnectionError(err: unknown): string {
   if (code === 'ETIMEDOUT' || code === 'ECONNRESET') return 'connection timed out'
   if (code === '28P01' || code === '28000') return 'authentication failed'
   if (code === '3D000') return 'database does not exist'
+  if (err instanceof Error && /tenant/i.test(err.message)) {
+    return 'the host is a Supavisor pooler that requires a tenant-qualified user (postgres.<tenant>); connect to the database port directly or qualify the username'
+  }
   if (err instanceof Error && /timeout/i.test(err.message)) return 'connection timed out'
   return 'connection failed'
 }
