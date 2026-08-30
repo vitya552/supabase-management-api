@@ -49,6 +49,7 @@ import {
   writeManifestFile,
   writeSecretsFile,
 } from './functions.js'
+import { isSmtpConfigured, sendInvitationEmail } from './mailer.js'
 import { proxyProjectRequest } from './project-proxy.js'
 import {
   createOrganization,
@@ -810,7 +811,13 @@ function externalDatabaseMetadata(dbUrl: string) {
  * project list/detail responses; callers fetch it explicitly. */
 function projectConnectionString(project: ProjectRecord): string | null {
   if (project.kind === 'compose' && project.secrets) {
-    return `postgresql://postgres:${encodeURIComponent(project.secrets.postgres_password)}@sbproj-${project.ref}-db:5432/postgres`
+    const password = encodeURIComponent(project.secrets.postgres_password)
+    // Prefer the published host port so the string works from outside Docker;
+    // projects created before port publishing only have the internal endpoint.
+    if (project.db_port !== null) {
+      return `postgresql://postgres:${password}@${publicHostname()}:${project.db_port}/postgres`
+    }
+    return `postgresql://postgres:${password}@sbproj-${project.ref}-db:5432/postgres`
   }
   if (project.kind === 'external' && project.external_db_url) {
     return project.external_db_url
@@ -1083,6 +1090,11 @@ app.get('/platform/dashboard-users/invitations', async (c) => {
   return c.json(await listInvitations())
 })
 
+// Whether invitation emails can be delivered (SMTP host + sender configured).
+app.get('/platform/dashboard-users/smtp-status', async (c) => {
+  return c.json({ configured: await isSmtpConfigured() })
+})
+
 app.post('/platform/dashboard-users/invitations', async (c) => {
   if (!canAdminister(c)) {
     return c.json({ message: 'only owners and admins can invite users' }, 403)
@@ -1108,8 +1120,29 @@ app.post('/platform/dashboard-users/invitations', async (c) => {
     invitedBy: identity?.username ?? 'service',
     invitedEmail,
   })
+
+  // Deliver via the deployment's SMTP (the same settings GoTrue uses).
+  // Delivery problems never fail the invitation itself: the raw token is
+  // still returned so the link can be shared manually.
+  let emailSent = false
+  let emailError: string | null = null
+  if (invitedEmail) {
+    const joinUrl = `${env.publicUrl.replace(/\/$/, '')}/join?token=${token}`
+    try {
+      emailSent = await sendInvitationEmail({
+        to: invitedEmail,
+        joinUrl,
+        invitedBy: identity?.username ?? 'service',
+        role,
+      })
+      if (!emailSent) emailError = 'SMTP is not configured'
+    } catch (err) {
+      emailError = err instanceof Error ? err.message : 'failed to send the invitation email'
+    }
+  }
+
   // The raw token is only returned here, once; the DB stores its hash.
-  return c.json({ ...invitation, token }, 201)
+  return c.json({ ...invitation, token, email_sent: emailSent, email_error: emailError }, 201)
 })
 
 app.delete('/platform/dashboard-users/invitations/:id', async (c) => {
