@@ -681,6 +681,21 @@ function projectResponse(project: ProjectRecord) {
   }
 }
 
+/** Maps a connection failure to a safe, credential-free message. */
+function classifyConnectionError(err: unknown): string {
+  const code =
+    err !== null && typeof err === 'object' && 'code' in err && typeof err.code === 'string'
+      ? err.code
+      : ''
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return 'host not found'
+  if (code === 'ECONNREFUSED') return 'connection refused'
+  if (code === 'ETIMEDOUT' || code === 'ECONNRESET') return 'connection timed out'
+  if (code === '28P01' || code === '28000') return 'authentication failed'
+  if (code === '3D000') return 'database does not exist'
+  if (err instanceof Error && /timeout/i.test(err.message)) return 'connection timed out'
+  return 'connection failed'
+}
+
 /** Non-secret connection metadata for an external database URL. */
 function externalDatabaseMetadata(dbUrl: string) {
   try {
@@ -752,6 +767,15 @@ app.post('/platform/projects', async (c) => {
         400
       )
     }
+    let parsedDbUrl: URL
+    try {
+      parsedDbUrl = new URL(dbUrl)
+    } catch {
+      return c.json({ message: 'invalid database connection string' }, 400)
+    }
+    if (!parsedDbUrl.hostname) {
+      return c.json({ message: 'database connection string must include a host' }, 400)
+    }
     const probe = new pg.Client({
       connectionString: dbUrl,
       connectionTimeoutMillis: 10_000,
@@ -760,7 +784,9 @@ app.post('/platform/projects', async (c) => {
       await probe.connect()
       await probe.query('select 1')
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
+      // pg errors can echo parts of the connection string; return only a
+      // stable classification of the failure.
+      const message = classifyConnectionError(err)
       return c.json({ message: `could not connect to database: ${message}` }, 400)
     } finally {
       await probe.end().catch(() => {})
