@@ -147,6 +147,14 @@ function requestIdentity(c: {
   return getSessionIdentity(token)
 }
 
+/** True when the request may perform owner-only actions (managing owners). */
+function isOwner(c: {
+  req: { header: (name: string) => string | undefined }
+}): boolean {
+  const identity = requestIdentity(c)
+  return identity === null || identity.role === 'owner'
+}
+
 /** True when the request may perform owner/admin-only actions. */
 function canAdminister(c: {
   req: { header: (name: string) => string | undefined }
@@ -983,6 +991,9 @@ app.post('/platform/dashboard-users', async (c) => {
   if (!DASHBOARD_ROLES.has(role)) {
     return c.json({ message: 'role must be owner, admin or developer' }, 400)
   }
+  if (role === 'owner' && !isOwner(c)) {
+    return c.json({ message: 'only owners can grant the owner role' }, 403)
+  }
   try {
     const user = await createDashboardUser({
       username: payload.username,
@@ -1004,7 +1015,13 @@ app.patch('/platform/dashboard-users/:username', async (c) => {
   if (!role || !DASHBOARD_ROLES.has(role)) {
     return c.json({ message: 'role must be owner, admin or developer' }, 400)
   }
-  const result = await updateDashboardUserRole(c.req.param('username'), role as DashboardRole)
+  const username = c.req.param('username')
+  const users = await listDashboardUsers()
+  const target = users.find((u) => u.username === username)
+  if ((role === 'owner' || target?.role === 'owner') && !isOwner(c)) {
+    return c.json({ message: 'only owners can manage the owner role' }, 403)
+  }
+  const result = await updateDashboardUserRole(username, role as DashboardRole)
   if (result.lastOwner) {
     return c.json({ message: 'the last owner cannot be demoted' }, 400)
   }
@@ -1013,10 +1030,17 @@ app.patch('/platform/dashboard-users/:username', async (c) => {
 })
 
 app.delete('/platform/dashboard-users/:username', async (c) => {
-  if (!canAdminister(c)) {
+  const username = c.req.param('username')
+  const identity = requestIdentity(c)
+  const isSelfRemoval = identity !== null && identity.username === username
+  if (!isSelfRemoval && !canAdminister(c)) {
     return c.json({ message: 'only owners and admins can manage users' }, 403)
   }
-  const result = await deleteDashboardUser(c.req.param('username'))
+  const existing = (await listDashboardUsers()).find((u) => u.username === username)
+  if (existing?.role === 'owner' && !isOwner(c)) {
+    return c.json({ message: 'only owners can remove owners' }, 403)
+  }
+  const result = await deleteDashboardUser(username)
   if (result.lastOwner) {
     return c.json({ message: 'the last owner cannot be deleted' }, 400)
   }
@@ -1039,6 +1063,9 @@ app.post('/platform/dashboard-users/invitations', async (c) => {
   const role = payload?.role ?? 'developer'
   if (!DASHBOARD_ROLES.has(role)) {
     return c.json({ message: 'role must be owner, admin or developer' }, 400)
+  }
+  if (role === 'owner' && !isOwner(c)) {
+    return c.json({ message: 'only owners can invite new owners' }, 403)
   }
   const invitedEmail = typeof payload?.invited_email === 'string' ? payload.invited_email : ''
   if (invitedEmail.length > 320) {
