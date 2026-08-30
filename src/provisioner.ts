@@ -69,6 +69,11 @@ networks:
     external: true
     name: ${env.mainNetworkName}
 
+volumes:
+  # Named volume so the image's bundled config files under
+  # /etc/postgresql-custom are copied in on first use.
+  db-config:
+
 services:
   db:
     container_name: ${name('db')}
@@ -83,7 +88,7 @@ services:
       - ${dir}/db-init/logs.sql:/docker-entrypoint-initdb.d/migrations/99-logs.sql:Z
       - ${dir}/db-init/pooler.sql:/docker-entrypoint-initdb.d/migrations/99-pooler.sql:Z
       - ${dir}/db-data:/var/lib/postgresql/data:Z
-      - ${dir}/db-config:/etc/postgresql-custom
+      - db-config:/etc/postgresql-custom
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "postgres", "-h", "localhost"]
       interval: 5s
@@ -237,7 +242,6 @@ async function writeProjectFiles(ref: string, secrets: ProjectSecrets): Promise<
   const dir = projectDir(ref)
   await mkdir(path.join(dir, 'db-init'), { recursive: true })
   await mkdir(path.join(dir, 'db-data'), { recursive: true })
-  await mkdir(path.join(dir, 'db-config'), { recursive: true })
   await mkdir(path.join(dir, 'storage'), { recursive: true })
   await mkdir(path.join(dir, 'functions'), { recursive: true })
 
