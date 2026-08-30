@@ -510,9 +510,13 @@ app.get('/dashboard-auth/login', (c) => {
 })
 
 app.post('/dashboard-auth/login', async (c) => {
+  // x-envoy-external-address is set by the gateway itself; the last entry of
+  // X-Forwarded-For is the one it appended. Earlier entries are client
+  // supplied and would let an attacker rotate the rate limit key.
+  const forwardedFor = c.req.header('x-forwarded-for')?.split(',') ?? []
   const clientKey =
-    c.req.header('x-forwarded-for')?.split(',')[0].trim() ||
     c.req.header('x-envoy-external-address') ||
+    forwardedFor.at(-1)?.trim() ||
     'unknown'
   if (isLoginRateLimited(clientKey)) {
     return c.json({ message: 'Too many sign in attempts, try again later' }, 429)
