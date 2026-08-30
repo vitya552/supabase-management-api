@@ -861,7 +861,16 @@ app.all('/proj/:ref/*', proxyProjectRequest)
 // -- Dashboard users (teams) ----------------------------------------------
 
 app.get('/platform/dashboard-users', async (c) => {
-  return c.json(await listDashboardUsers())
+  const users = await listDashboardUsers()
+  // The break-glass `.env` login is not a dashboard_users row; surface it as a
+  // virtual owner so member lists are complete for every viewer.
+  if (env.dashboardUsername && !users.some((u) => u.username === env.dashboardUsername)) {
+    return c.json([
+      { id: 0, username: env.dashboardUsername, role: 'owner', inserted_at: '' },
+      ...users,
+    ])
+  }
+  return c.json(users)
 })
 
 // The caller's own identity/role, for role-aware UI.
