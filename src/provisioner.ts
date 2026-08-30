@@ -43,6 +43,15 @@ export function containerName(ref: string, service: string): string {
   return `sbproj-${ref}-${service}`
 }
 
+/**
+ * Realtime resolves its tenant from the first label of the Host header, so
+ * the container's DNS name must start with the seeded tenant id
+ * (`realtime-dev`), mirroring the main stack's `realtime-dev.supabase-realtime`.
+ */
+export function realtimeContainerName(ref: string): string {
+  return `realtime-dev.${containerName(ref, 'realtime')}`
+}
+
 async function compose(ref: string, args: string[]): Promise<void> {
   await execFileAsync(
     'docker',
@@ -200,6 +209,32 @@ services:
     volumes:
       - ${dir}/storage:/var/lib/storage:z
 
+  ${name('realtime')}:
+    container_name: ${realtimeContainerName(ref)}
+    image: ${env.projectImages.realtime}
+    restart: unless-stopped
+    depends_on:
+      ${name('db')}:
+        condition: service_healthy
+    environment:
+      PORT: 4000
+      DB_HOST: ${name('db')}
+      DB_PORT: 5432
+      DB_USER: supabase_admin
+      DB_PASSWORD: \${POSTGRES_PASSWORD}
+      DB_NAME: postgres
+      DB_AFTER_CONNECT_QUERY: 'SET search_path TO _realtime'
+      DB_ENC_KEY: supabaserealtime
+      API_JWT_SECRET: \${JWT_SECRET}
+      SECRET_KEY_BASE: \${SECRET_KEY_BASE}
+      METRICS_JWT_SECRET: \${JWT_SECRET}
+      ERL_AFLAGS: -proto_dist inet_tcp
+      DNS_NODES: "''"
+      RLIMIT_NOFILE: "10000"
+      APP_NAME: realtime
+      SEED_SELF_HOST: "true"
+      RUN_JANITOR: "true"
+
   ${name('functions')}:
     container_name: ${name('functions')}
     image: ${env.projectImages.edgeRuntime}
@@ -234,6 +269,7 @@ function envFile(ref: string, secrets: ProjectSecrets): string {
     `JWT_SECRET=${secrets.jwt_secret}`,
     `ANON_KEY=${secrets.anon_key}`,
     `SERVICE_ROLE_KEY=${secrets.service_role_key}`,
+    `SECRET_KEY_BASE=${secrets.secret_key_base ?? randomBytes(32).toString('hex')}`,
     `SITE_URL=${env.publicUrl}`,
     `API_EXTERNAL_URL=${publicBase}/auth/v1`,
     `STORAGE_PUBLIC_URL=${publicBase}`,
@@ -278,6 +314,7 @@ export function generateProjectSecrets(): ProjectSecrets {
     jwt_secret: jwtSecret,
     anon_key: mintApiKey('anon', jwtSecret),
     service_role_key: mintApiKey('service_role', jwtSecret),
+    secret_key_base: randomBytes(32).toString('hex'),
   }
 }
 

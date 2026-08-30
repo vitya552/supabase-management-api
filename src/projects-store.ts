@@ -17,6 +17,8 @@ export type ProjectSecrets = {
   jwt_secret: string
   anon_key: string
   service_role_key: string
+  /** Absent on projects provisioned before Realtime support. */
+  secret_key_base?: string
 }
 
 export type ProjectRecord = {

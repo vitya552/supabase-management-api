@@ -51,7 +51,8 @@ import {
   writeSecretsFile,
 } from './functions.js'
 import { isSmtpConfigured, sendInvitationEmail } from './mailer.js'
-import { proxyProjectRequest } from './project-proxy.js'
+import { handleProjectUpgrade, proxyProjectRequest } from './project-proxy.js'
+import { getRealtimeConfig, updateRealtimeConfig } from './realtime-config.js'
 import {
   createOrganization,
   createProjectRecord,
@@ -1014,6 +1015,29 @@ app.delete('/platform/projects/:ref', async (c) => {
 // gateway. The project's own services authenticate each request.
 app.all('/proj/:ref/*', proxyProjectRequest)
 
+// -- Realtime configuration -------------------------------------------------
+
+app.get('/platform/projects/:ref/config/realtime', async (c) => {
+  const config = await getRealtimeConfig(c.req.param('ref'))
+  if (config === null) {
+    return c.json({ message: 'Realtime is not available for this project' }, 404)
+  }
+  return c.json(config)
+})
+
+app.patch('/platform/projects/:ref/config/realtime', async (c) => {
+  if (!(await canAdminister(c))) {
+    return c.json({ message: 'only owners and admins can update realtime settings' }, 403)
+  }
+  const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null
+  if (body === null) return c.json({ message: 'invalid JSON body' }, 400)
+  const config = await updateRealtimeConfig(c.req.param('ref'), body)
+  if (config === null) {
+    return c.json({ message: 'Realtime is not available for this project' }, 404)
+  }
+  return c.json(config)
+})
+
 // -- Dashboard users (teams) ----------------------------------------------
 
 app.get('/platform/dashboard-users', async (c) => {
@@ -1271,9 +1295,11 @@ async function main() {
   // has to exist (with the stack's own keys) before PostgREST starts.
   await syncThirdPartyJwks()
   if (env.functionsDir) await syncFunctionManifest('default', env.functionsDir)
-  serve({ fetch: app.fetch, port: env.port }, (info) => {
+  const server = serve({ fetch: app.fetch, port: env.port }, (info) => {
     console.log(`management-api listening on :${info.port}`)
   })
+  // Websocket upgrades (project Realtime) bypass Hono's fetch adapter.
+  server.on('upgrade', handleProjectUpgrade)
   // Bring project stacks back up after a host/daemon restart, in background.
   void resumeProjects().catch((err) => console.error('resuming projects failed:', err))
 }

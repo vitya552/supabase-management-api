@@ -95,6 +95,10 @@ export const env = {
   /** Docker network shared with the main stack, joined by project stacks. */
   mainNetworkName: process.env.MAIN_NETWORK_NAME ?? 'supabase_default',
 
+  /** Realtime service of the default stack (tenant admin + websocket host). */
+  realtimeHost: process.env.REALTIME_HOST ?? 'realtime-dev.supabase-realtime',
+  realtimePort: Number(process.env.REALTIME_PORT ?? 4000),
+
   /** Images used for per-project stacks; keep in sync with docker-compose.yml. */
   projectImages: {
     postgres: process.env.PROJECT_POSTGRES_IMAGE ?? 'supabase/postgres:17.6.1.136',
@@ -102,5 +106,6 @@ export const env = {
     gotrue: process.env.PROJECT_GOTRUE_IMAGE ?? 'supabase/gotrue:v2.189.0',
     storage: process.env.PROJECT_STORAGE_IMAGE ?? 'supabase/storage-api:v1.60.4',
     edgeRuntime: process.env.PROJECT_EDGE_RUNTIME_IMAGE ?? 'supabase/edge-runtime:v1.74.0',
+    realtime: process.env.PROJECT_REALTIME_IMAGE ?? 'supabase/realtime:v2.102.3',
   },
 }
