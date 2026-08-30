@@ -134,6 +134,26 @@ export async function updateDashboardUserRole(
   return { updated: (rowCount ?? 0) > 0, lastOwner: false }
 }
 
+export async function updateDashboardUserPassword(
+  username: string,
+  currentPassword: string,
+  newPassword: string
+): Promise<'updated' | 'not_found' | 'wrong_password'> {
+  const { rows } = await pool.query(
+    'select password_hash from management.dashboard_users where username = $1',
+    [username]
+  )
+  const stored: string | undefined = rows[0]?.password_hash
+  if (!stored) return 'not_found'
+  if (!(await verifyPassword(currentPassword, stored))) return 'wrong_password'
+  const passwordHash = await hashPassword(newPassword)
+  await pool.query('update management.dashboard_users set password_hash = $2 where username = $1', [
+    username,
+    passwordHash,
+  ])
+  return 'updated'
+}
+
 export type DashboardInvitation = {
   id: number
   role: DashboardRole
