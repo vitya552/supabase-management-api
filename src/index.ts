@@ -56,6 +56,7 @@ import {
   generateRef,
   getProject,
   listOrganizations,
+  updateOrganization,
   listProjects,
   migrateProjects,
   type ProjectRecord,
@@ -780,6 +781,33 @@ function projectConnectionString(project: ProjectRecord): string | null {
 
 app.get('/platform/organizations', async (c) => {
   return c.json(await listOrganizations())
+})
+
+app.patch('/platform/organizations/:slug', async (c) => {
+  if (!canAdminister(c)) {
+    return c.json({ message: 'only owners and admins can update organizations' }, 403)
+  }
+  const payload = await c.req.json<{ name?: string; opt_in_tags?: string[] }>().catch(() => null)
+  if (!payload) return c.json({ message: 'invalid JSON body' }, 400)
+  const patch: { name?: string; opt_in_tags?: string[] } = {}
+  if (payload.name !== undefined) {
+    if (typeof payload.name !== 'string' || payload.name.trim().length === 0) {
+      return c.json({ message: '`name` must be a non-empty string' }, 400)
+    }
+    patch.name = payload.name.trim()
+  }
+  if (payload.opt_in_tags !== undefined) {
+    if (
+      !Array.isArray(payload.opt_in_tags) ||
+      payload.opt_in_tags.some((tag) => typeof tag !== 'string')
+    ) {
+      return c.json({ message: '`opt_in_tags` must be an array of strings' }, 400)
+    }
+    patch.opt_in_tags = payload.opt_in_tags
+  }
+  const updated = await updateOrganization(c.req.param('slug'), patch)
+  if (!updated) return c.json({ message: 'organization not found' }, 404)
+  return c.json(updated)
 })
 
 app.post('/platform/organizations', async (c) => {

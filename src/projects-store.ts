@@ -38,6 +38,7 @@ export type OrganizationRecord = {
   id: number
   slug: string
   name: string
+  opt_in_tags: string[]
 }
 
 export async function migrateProjects(): Promise<void> {
@@ -71,6 +72,8 @@ export async function migrateProjects(): Promise<void> {
       on conflict (id) do nothing;
     select setval('management.projects_id_seq',
       (select greatest(max(id), 1) from management.projects));
+    alter table management.organizations
+      add column if not exists opt_in_tags jsonb not null default '[]'::jsonb;
   `)
 }
 
@@ -166,9 +169,32 @@ export async function deleteProjectRecord(ref: string): Promise<void> {
 
 export async function listOrganizations(): Promise<OrganizationRecord[]> {
   const { rows } = await pool.query(
-    'select id, slug, name from management.organizations order by id'
+    'select id, slug, name, opt_in_tags from management.organizations order by id'
   )
   return rows
+}
+
+export async function getOrganization(slug: string): Promise<OrganizationRecord | null> {
+  const { rows } = await pool.query(
+    'select id, slug, name, opt_in_tags from management.organizations where slug = $1',
+    [slug]
+  )
+  return rows[0] ?? null
+}
+
+export async function updateOrganization(
+  slug: string,
+  patch: { name?: string; opt_in_tags?: string[] }
+): Promise<OrganizationRecord | null> {
+  const { rows } = await pool.query(
+    `update management.organizations
+       set name = coalesce($2, name),
+           opt_in_tags = coalesce($3::jsonb, opt_in_tags)
+     where slug = $1
+     returning id, slug, name, opt_in_tags`,
+    [slug, patch.name ?? null, patch.opt_in_tags ? JSON.stringify(patch.opt_in_tags) : null]
+  )
+  return rows[0] ?? null
 }
 
 export async function createOrganization(name: string): Promise<OrganizationRecord> {
@@ -178,7 +204,7 @@ export async function createOrganization(name: string): Promise<OrganizationReco
     .replace(/^-+|-+$/g, '')
     .slice(0, 30) || 'org'}-${randomBytes(3).toString('hex')}`
   const { rows } = await pool.query(
-    'insert into management.organizations (slug, name) values ($1, $2) returning id, slug, name',
+    'insert into management.organizations (slug, name) values ($1, $2) returning id, slug, name, opt_in_tags',
     [slug, name]
   )
   return rows[0]
