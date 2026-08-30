@@ -57,6 +57,14 @@ async function verifyPassword(password: string, stored: string): Promise<boolean
   return derived.length === expected.length && timingSafeEqual(derived, expected)
 }
 
+export async function getDashboardUser(username: string): Promise<DashboardUser | null> {
+  const { rows } = await pool.query(
+    'select id, username, role, inserted_at from management.dashboard_users where username = $1',
+    [username]
+  )
+  return rows[0] ?? null
+}
+
 export async function listDashboardUsers(): Promise<DashboardUser[]> {
   const { rows } = await pool.query(
     'select id, username, role, inserted_at from management.dashboard_users order by id'
