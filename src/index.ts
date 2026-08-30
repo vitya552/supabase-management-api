@@ -592,8 +592,6 @@ function projectResponse(project: ProjectRecord) {
       project.kind === 'compose'
         ? `${env.publicUrl.replace(/\/$/, '')}/proj/${project.ref}`
         : null,
-    anon_key: project.secrets?.anon_key ?? null,
-    service_role_key: project.secrets?.service_role_key ?? null,
     database:
       project.kind === 'compose' && project.secrets
         ? {
@@ -601,12 +599,38 @@ function projectResponse(project: ProjectRecord) {
             port: 5432,
             user: 'postgres',
             name: 'postgres',
-            connection_string: `postgresql://postgres:${project.secrets.postgres_password}@sbproj-${project.ref}-db:5432/postgres`,
           }
         : project.kind === 'external' && project.external_db_url
-          ? { connection_string: project.external_db_url }
+          ? externalDatabaseMetadata(project.external_db_url)
           : null,
   }
+}
+
+/** Non-secret connection metadata for an external database URL. */
+function externalDatabaseMetadata(dbUrl: string) {
+  try {
+    const url = new URL(dbUrl)
+    return {
+      host: url.hostname,
+      port: url.port ? Number(url.port) : 5432,
+      user: url.username ? decodeURIComponent(url.username) : 'postgres',
+      name: url.pathname.replace(/^\//, '') || 'postgres',
+    }
+  } catch {
+    return null
+  }
+}
+
+/** Full connection string for a project's database. Never included in
+ * project list/detail responses; callers fetch it explicitly. */
+function projectConnectionString(project: ProjectRecord): string | null {
+  if (project.kind === 'compose' && project.secrets) {
+    return `postgresql://postgres:${encodeURIComponent(project.secrets.postgres_password)}@sbproj-${project.ref}-db:5432/postgres`
+  }
+  if (project.kind === 'external' && project.external_db_url) {
+    return project.external_db_url
+  }
+  return null
 }
 
 app.get('/platform/organizations', async (c) => {
@@ -689,6 +713,26 @@ app.get('/platform/projects/:ref', async (c) => {
   const project = await getProject(c.req.param('ref'))
   if (!project) return c.json({ message: 'project not found' }, 404)
   return c.json(projectResponse(project))
+})
+
+app.get('/platform/projects/:ref/connection-string', async (c) => {
+  const project = await getProject(c.req.param('ref'))
+  if (!project) return c.json({ message: 'project not found' }, 404)
+  const connectionString = projectConnectionString(project)
+  if (connectionString === null) {
+    return c.json({ message: 'project has no managed database' }, 404)
+  }
+  return c.json({ connection_string: connectionString })
+})
+
+app.get('/platform/projects/:ref/api-keys', async (c) => {
+  const project = await getProject(c.req.param('ref'))
+  if (!project) return c.json({ message: 'project not found' }, 404)
+  if (!project.secrets) return c.json([])
+  return c.json([
+    { name: 'anon key', api_key: project.secrets.anon_key, tags: 'anon' },
+    { name: 'service_role key', api_key: project.secrets.service_role_key, tags: 'service_role' },
+  ])
 })
 
 app.delete('/platform/projects/:ref', async (c) => {
