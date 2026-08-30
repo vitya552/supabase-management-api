@@ -85,7 +85,7 @@ volumes:
   db-config:
 
 services:
-  db:
+  ${name('db')}:
     container_name: ${name('db')}
     image: ${env.projectImages.postgres}
     restart: unless-stopped
@@ -123,12 +123,12 @@ services:
         "log_min_messages=fatal"
       ]
 
-  rest:
+  ${name('rest')}:
     container_name: ${name('rest')}
     image: ${env.projectImages.postgrest}
     restart: unless-stopped
     depends_on:
-      db:
+      ${name('db')}:
         condition: service_healthy
     environment:
       PGRST_DB_URI: postgres://authenticator:\${POSTGRES_PASSWORD}@${name('db')}:5432/postgres
@@ -142,12 +142,12 @@ services:
       PGRST_APP_SETTINGS_JWT_EXP: 3600
     command: ["postgrest"]
 
-  auth:
+  ${name('auth')}:
     container_name: ${name('auth')}
     image: ${env.projectImages.gotrue}
     restart: unless-stopped
     depends_on:
-      db:
+      ${name('db')}:
         condition: service_healthy
     environment:
       GOTRUE_API_HOST: 0.0.0.0
@@ -169,14 +169,14 @@ services:
       GOTRUE_EXTERNAL_PHONE_ENABLED: "false"
       GOTRUE_SMS_AUTOCONFIRM: "false"
 
-  storage:
+  ${name('storage')}:
     container_name: ${name('storage')}
     image: ${env.projectImages.storage}
     restart: unless-stopped
     depends_on:
-      db:
+      ${name('db')}:
         condition: service_healthy
-      rest:
+      ${name('rest')}:
         condition: service_started
     environment:
       ANON_KEY: \${ANON_KEY}
@@ -196,12 +196,12 @@ services:
     volumes:
       - ${dir}/storage:/var/lib/storage:z
 
-  functions:
+  ${name('functions')}:
     container_name: ${name('functions')}
     image: ${env.projectImages.edgeRuntime}
     restart: unless-stopped
     depends_on:
-      db:
+      ${name('db')}:
         condition: service_healthy
     volumes:
       - ${dir}/functions:/home/deno/functions:z
