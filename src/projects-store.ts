@@ -131,6 +131,22 @@ export async function getProject(ref: string): Promise<ProjectRecord | null> {
   return rows[0] ? rowToProject(rows[0]) : null
 }
 
+/**
+ * Superuser connection string for a project's database, reachable from
+ * inside the docker network. Returns null for unknown projects.
+ */
+export async function projectDatabaseUrl(ref: string): Promise<string | null> {
+  if (ref === 'default') return null
+  const project = await getProject(ref)
+  if (!project) return null
+  if (project.kind === 'compose' && project.secrets) {
+    const password = encodeURIComponent(project.secrets.postgres_password)
+    return `postgresql://postgres:${password}@sbproj-${ref}-db:5432/postgres`
+  }
+  if (project.kind === 'external' && project.external_db_url) return project.external_db_url
+  return null
+}
+
 export async function createProjectRecord(input: {
   ref: string
   name: string

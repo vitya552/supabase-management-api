@@ -1,6 +1,7 @@
 import pg from 'pg'
 
 import { env } from './env.js'
+import { projectDatabaseUrl } from './projects-store.js'
 import { pool } from './store.js'
 
 /**
@@ -68,11 +69,21 @@ export function validateGucValue(name: string, value: unknown): string | null {
   return null
 }
 
-export async function getPostgresConfig(): Promise<Record<string, PostgresConfigValue>> {
+/** The superuser connection string for a project's Postgres, or null. */
+async function databaseUrlFor(ref: string): Promise<string | null> {
+  if (ref === 'default') return env.databaseUrl
+  return projectDatabaseUrl(ref)
+}
+
+export async function getPostgresConfig(
+  ref: string
+): Promise<Record<string, PostgresConfigValue> | null> {
+  const dbUrl = await databaseUrlFor(ref)
+  if (!dbUrl) return null
   // A fresh connection is used because backend-context settings (e.g.
   // log_connections) are fixed at connection start, so long-lived pooled
   // sessions would report stale values.
-  const client = new pg.Client({ connectionString: env.databaseUrl })
+  const client = new pg.Client({ connectionString: dbUrl })
   await client.connect()
   let rows: { name: string; setting: string; unit: string | null }[]
   try {
@@ -100,9 +111,17 @@ function quoteLiteral(value: PostgresConfigValue): string {
 }
 
 export async function updatePostgresConfig(
+  ref: string,
   patch: Record<string, PostgresConfigValue>
-): Promise<{ config: Record<string, PostgresConfigValue>; restart_required: string[] }> {
-  const client = await pool.connect()
+): Promise<{ config: Record<string, PostgresConfigValue>; restart_required: string[] } | null> {
+  const dbUrl = await databaseUrlFor(ref)
+  if (!dbUrl) return null
+  const isPooled = ref === 'default'
+  const pooledClient = isPooled ? await pool.connect() : null
+  const directClient = isPooled ? null : new pg.Client({ connectionString: dbUrl })
+  if (directClient) await directClient.connect()
+  const client = pooledClient ?? directClient!
+  let pendingRestart: string[]
   try {
     for (const [name, value] of Object.entries(patch)) {
       // ALTER SYSTEM cannot run inside a transaction block.
@@ -112,12 +131,16 @@ export async function updatePostgresConfig(
     // The SIGHUP reload is asynchronous; give the postmaster a moment so the
     // config read below reflects the new values.
     await client.query(`select pg_sleep(0.2)`)
+    const { rows } = await client.query<{ name: string }>(
+      `select name from pg_settings where pending_restart`
+    )
+    pendingRestart = rows.map((row) => row.name)
   } finally {
-    client.release()
+    if (pooledClient) pooledClient.release()
+    if (directClient) await directClient.end().catch(() => undefined)
   }
 
-  const { rows } = await pool.query<{ name: string }>(
-    `select name from pg_settings where pending_restart`
-  )
-  return { config: await getPostgresConfig(), restart_required: rows.map((row) => row.name) }
+  const config = await getPostgresConfig(ref)
+  if (config === null) return null
+  return { config, restart_required: pendingRestart }
 }

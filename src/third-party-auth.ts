@@ -1,9 +1,12 @@
 import { lookup } from 'node:dns/promises'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { isIP } from 'node:net'
-import { dirname } from 'node:path'
+import { dirname, join } from 'node:path'
+
+import pg from 'pg'
 
 import { env } from './env.js'
+import { getProject } from './projects-store.js'
 import { pool } from './store.js'
 
 export type ThirdPartyIntegration = {
@@ -132,53 +135,72 @@ export async function migrateThirdPartyAuth(): Promise<void> {
       inserted_at timestamptz not null default now(),
       updated_at timestamptz not null default now()
     );
+    alter table management.third_party_auth
+      add column if not exists project_ref text not null default 'default';
   `)
 }
 
-export async function listIntegrations(): Promise<ThirdPartyIntegration[]> {
+export async function listIntegrations(projectRef: string): Promise<ThirdPartyIntegration[]> {
   const { rows } = await pool.query(
-    'select * from management.third_party_auth order by inserted_at'
+    'select * from management.third_party_auth where project_ref = $1 order by inserted_at',
+    [projectRef]
   )
   return rows.map(withType)
 }
 
-export async function getIntegration(id: string): Promise<ThirdPartyIntegration | null> {
-  const { rows } = await pool.query('select * from management.third_party_auth where id = $1', [
-    id,
-  ])
+export async function getIntegration(
+  projectRef: string,
+  id: string
+): Promise<ThirdPartyIntegration | null> {
+  const { rows } = await pool.query(
+    'select * from management.third_party_auth where project_ref = $1 and id = $2',
+    [projectRef, id]
+  )
   return rows[0] ? withType(rows[0]) : null
 }
 
-export async function createIntegration(input: {
-  oidc_issuer_url?: string | null
-  jwks_url?: string | null
-  custom_jwks?: unknown
-}): Promise<ThirdPartyIntegration> {
+export async function createIntegration(
+  projectRef: string,
+  input: {
+    oidc_issuer_url?: string | null
+    jwks_url?: string | null
+    custom_jwks?: unknown
+  }
+): Promise<ThirdPartyIntegration> {
   const jwks = await resolveJwks(input)
   const { rows } = await pool.query(
     `insert into management.third_party_auth
-       (oidc_issuer_url, jwks_url, custom_jwks, resolved_jwks, resolved_at)
-     values ($1, $2, $3::jsonb, $4::jsonb, now())
+       (project_ref, oidc_issuer_url, jwks_url, custom_jwks, resolved_jwks, resolved_at)
+     values ($1, $2, $3, $4::jsonb, $5::jsonb, now())
      returning *`,
     [
+      projectRef,
       input.oidc_issuer_url ?? null,
       input.jwks_url ?? null,
       input.custom_jwks == null ? null : JSON.stringify(input.custom_jwks),
       JSON.stringify(jwks),
     ]
   )
-  await syncThirdPartyJwks()
+  await syncThirdPartyJwks(projectRef)
   return withType(rows[0])
 }
 
-export async function deleteIntegration(id: string): Promise<ThirdPartyIntegration | null> {
+export async function deleteIntegration(
+  projectRef: string,
+  id: string
+): Promise<ThirdPartyIntegration | null> {
   const { rows } = await pool.query(
-    'delete from management.third_party_auth where id = $1 returning *',
-    [id]
+    'delete from management.third_party_auth where project_ref = $1 and id = $2 returning *',
+    [projectRef, id]
   )
   if (!rows[0]) return null
-  await syncThirdPartyJwks()
+  await syncThirdPartyJwks(projectRef)
   return withType(rows[0])
+}
+
+/** Removes all integrations belonging to a project (deprovision). */
+export async function deleteProjectIntegrations(projectRef: string): Promise<void> {
+  await pool.query('delete from management.third_party_auth where project_ref = $1', [projectRef])
 }
 
 function withType(row: Omit<ThirdPartyIntegration, 'type'>): ThirdPartyIntegration {
@@ -227,28 +249,64 @@ function baselineKeys(): unknown[] {
  * config reload, so the symmetric secret never has to be stored in the
  * database catalog, which is readable by every role.
  */
-export async function syncThirdPartyJwks(): Promise<void> {
-  const integrations = await listIntegrations()
+export async function syncThirdPartyJwks(projectRef: string = 'default'): Promise<void> {
+  const integrations = await listIntegrations(projectRef)
 
-  const keys: unknown[] = [...baselineKeys()]
+  const keys: unknown[] = [...(await baselineKeysFor(projectRef))]
   for (const integration of integrations) {
     if (isJwks(integration.resolved_jwks)) keys.push(...integration.resolved_jwks.keys)
   }
 
-  await mkdir(dirname(env.postgrestJwksFile), { recursive: true })
+  const target = projectJwksFile(projectRef)
+  if (!target) return
+  await mkdir(dirname(target), { recursive: true })
   // Readable by any user inside the container because postgrest runs as a
   // different one; the file lives on a dedicated volume mounted only into this
   // service and postgrest, so it is no more exposed than the env var it
   // replaces.
-  await writeFile(env.postgrestJwksFile, `${JSON.stringify({ keys })}\n`, {
+  await writeFile(target, `${JSON.stringify({ keys })}\n`, {
     encoding: 'utf8',
     mode: 0o644,
   })
 
-  // Older revisions of this service kept the key set in the role's config;
-  // that setting takes precedence over the file, so it is cleared.
-  await pool
-    .query('alter role authenticator reset pgrst.jwt_secret')
-    .catch(() => undefined)
-  await pool.query(`notify pgrst, 'reload config'`)
+  if (projectRef === 'default') {
+    // Older revisions of this service kept the key set in the role's config;
+    // that setting takes precedence over the file, so it is cleared.
+    await pool.query('alter role authenticator reset pgrst.jwt_secret').catch(() => undefined)
+    await pool.query(`notify pgrst, 'reload config'`)
+    return
+  }
+
+  // Project PostgREST listens for reload notifications on its own database.
+  const project = await getProject(projectRef)
+  if (!project || project.kind !== 'compose' || !project.secrets) return
+  const password = encodeURIComponent(project.secrets.postgres_password)
+  const client = new pg.Client({
+    connectionString: `postgresql://postgres:${password}@sbproj-${projectRef}-db:5432/postgres`,
+  })
+  try {
+    await client.connect()
+    await client.query(`notify pgrst, 'reload config'`)
+  } catch {
+    // The stack may still be coming up; PostgREST reads the file on start.
+  } finally {
+    await client.end().catch(() => undefined)
+  }
+}
+
+/** Where the trusted JWK set for a project's PostgREST lives. */
+function projectJwksFile(projectRef: string): string | null {
+  if (projectRef === 'default') return env.postgrestJwksFile
+  if (!env.projectsDir) return null
+  return join(env.projectsDir, projectRef, 'postgrest', 'jwks.json')
+}
+
+/** The project's own keys, trusted regardless of third-party integrations. */
+async function baselineKeysFor(projectRef: string): Promise<unknown[]> {
+  if (projectRef === 'default') return baselineKeys()
+  const project = await getProject(projectRef)
+  if (!project || !project.secrets) return []
+  return [
+    { kty: 'oct', k: base64Url(Buffer.from(project.secrets.jwt_secret, 'utf8')), alg: 'HS256' },
+  ]
 }

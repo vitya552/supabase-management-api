@@ -34,6 +34,7 @@ import {
   listDashboardUsers,
   listInvitations,
   migrateDashboardUsers,
+  updateDashboardUserPassword,
   updateDashboardUserRole,
   verifyDashboardUser,
 } from './dashboard-users.js'
@@ -120,7 +121,8 @@ app.get('/health', (c) => c.json({ status: 'ok' }))
  * Unauthenticated by design: only reachable on the internal docker network.
  */
 app.get('/templates/:type', async (c) => {
-  const template = await getEmailTemplate(c.req.param('type'))
+  const ref = c.req.query('ref') ?? 'default'
+  const template = await getEmailTemplate(ref, c.req.param('type'))
   if (!template) return c.text('template not found', 404)
   return c.html(template.rendered_html)
 })
@@ -206,7 +208,18 @@ function validateConfigPayload(payload: Record<string, unknown>): {
   return { valid, errors }
 }
 
-async function applyConfigPatch(payload: Record<string, unknown>) {
+/**
+ * Resolves which project an auth config request targets. The default stack
+ * and compose projects run their own GoTrue; external projects have none.
+ */
+async function resolveAuthRef(ref: string): Promise<string | null> {
+  if (ref === 'default') return 'default'
+  const project = await getProject(ref)
+  if (!project || project.kind !== 'compose') return null
+  return ref
+}
+
+async function applyConfigPatch(ref: string, payload: Record<string, unknown>) {
   const { valid, errors } = validateConfigPayload(payload)
   if (errors.length > 0) return { errors }
 
@@ -216,9 +229,9 @@ async function applyConfigPatch(payload: Record<string, unknown>) {
     const templateType = templateTypeFromConfigKey(key)
     if (!templateType) continue
     if (value === null) {
-      await deleteEmailTemplate(templateType)
+      await deleteEmailTemplate(ref, templateType)
     } else if (typeof value === 'string') {
-      await upsertEmailTemplate({
+      await upsertEmailTemplate(ref, {
         template_type: templateType,
         source: value,
         source_format: 'html',
@@ -227,13 +240,33 @@ async function applyConfigPatch(payload: Record<string, unknown>) {
     }
   }
 
-  await upsertConfig(valid)
-  await syncEnvFile()
+  await upsertConfig(ref, valid)
+  await syncEnvFile(ref)
   return { errors: [] as string[] }
 }
 
-async function currentConfig() {
-  const stored = await getAllConfig()
+/**
+ * Static configuration a compose project's GoTrue container is generated
+ * with (see provisioner.ts), mirrored so the dashboard shows the real
+ * effective values before any runtime overrides exist.
+ */
+function composeProjectBaseline(ref: string): Record<string, ConfigValue> {
+  const publicBase = `${env.publicUrl.replace(/\/$/, '')}/proj/${ref}`
+  return {
+    SITE_URL: env.publicUrl,
+    URI_ALLOW_LIST: '',
+    DISABLE_SIGNUP: false,
+    JWT_EXP: 3600,
+    EXTERNAL_EMAIL_ENABLED: true,
+    MAILER_AUTOCONFIRM: true,
+    EXTERNAL_PHONE_ENABLED: false,
+    SMS_AUTOCONFIRM: false,
+    API_EXTERNAL_URL: `${publicBase}/auth/v1`,
+  }
+}
+
+async function currentConfig(ref: string) {
+  const stored = await getAllConfig(ref)
   const templatesCustom: Record<string, boolean> = {}
   const subjectsCustom: Record<string, boolean> = {}
   for (const key of Object.keys(stored)) {
@@ -242,7 +275,7 @@ async function currentConfig() {
   }
   return {
     ...defaultAuthConfig(),
-    ...baselineConfig(),
+    ...(ref === 'default' ? baselineConfig() : composeProjectBaseline(ref)),
     ...stored,
     MAILER_TEMPLATES_CUSTOM_CONTENTS: templatesCustom,
     MAILER_SUBJECTS_CUSTOM_CONTENTS: subjectsCustom,
@@ -250,21 +283,27 @@ async function currentConfig() {
 }
 
 app.get('/platform/auth/:ref/config', async (c) => {
-  return c.json(await currentConfig())
+  const ref = await resolveAuthRef(c.req.param('ref'))
+  if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
+  return c.json(await currentConfig(ref))
 })
 
 app.patch('/platform/auth/:ref/config', async (c) => {
+  const ref = await resolveAuthRef(c.req.param('ref'))
+  if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
   const payload = await c.req.json<Record<string, unknown>>()
-  const { errors } = await applyConfigPatch(payload)
+  const { errors } = await applyConfigPatch(ref, payload)
   if (errors.length > 0) return c.json({ message: errors.join('; ') }, 400)
-  return c.json(await currentConfig())
+  return c.json(await currentConfig(ref))
 })
 
 app.patch('/platform/auth/:ref/config/hooks', async (c) => {
+  const ref = await resolveAuthRef(c.req.param('ref'))
+  if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
   const payload = await c.req.json<Record<string, unknown>>()
-  const { errors } = await applyConfigPatch(payload)
+  const { errors } = await applyConfigPatch(ref, payload)
   if (errors.length > 0) return c.json({ message: errors.join('; ') }, 400)
-  return c.json(await currentConfig())
+  return c.json(await currentConfig(ref))
 })
 
 /**
@@ -284,15 +323,17 @@ function templateParam(c: { req: { param: (name: string) => string } }): string 
 }
 
 app.post('/platform/auth/:ref/templates/:template/reset', async (c) => {
+  const ref = await resolveAuthRef(c.req.param('ref'))
+  if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
   const template = templateParam(c)
   if (!template) return c.json({ message: 'unknown template type' }, 400)
-  await deleteEmailTemplate(template)
-  await deleteConfig([
+  await deleteEmailTemplate(ref, template)
+  await deleteConfig(ref, [
     `MAILER_TEMPLATES_${template.toUpperCase()}_CONTENT`,
     `MAILER_SUBJECTS_${template.toUpperCase()}`,
   ])
-  await syncEnvFile()
-  return c.json(await currentConfig())
+  await syncEnvFile(ref)
+  return c.json(await currentConfig(ref))
 })
 
 /**
@@ -301,6 +342,8 @@ app.post('/platform/auth/:ref/templates/:template/reset', async (c) => {
  * HTML and wires it up as the GoTrue template for the given type.
  */
 app.put('/platform/auth/:ref/templates/:template/react', async (c) => {
+  const ref = await resolveAuthRef(c.req.param('ref'))
+  if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
   const template = templateParam(c)
   if (!template) return c.json({ message: 'unknown template type' }, 400)
   const { source } = await c.req.json<{ source?: string }>()
@@ -316,21 +359,25 @@ app.put('/platform/auth/:ref/templates/:template/react', async (c) => {
     return c.json({ message: `failed to render template: ${message}` }, 400)
   }
 
-  await upsertEmailTemplate({
+  await upsertEmailTemplate(ref, {
     template_type: template,
     source,
     source_format: 'react',
     rendered_html: renderedHtml,
   })
-  await upsertConfig({ [`MAILER_TEMPLATES_${template.toUpperCase()}_CONTENT`]: renderedHtml })
-  await syncEnvFile()
+  await upsertConfig(ref, {
+    [`MAILER_TEMPLATES_${template.toUpperCase()}_CONTENT`]: renderedHtml,
+  })
+  await syncEnvFile(ref)
   return c.json({ template_type: template, rendered_html: renderedHtml })
 })
 
 app.get('/platform/auth/:ref/templates/:template/react', async (c) => {
+  const ref = await resolveAuthRef(c.req.param('ref'))
+  if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
   const type = templateParam(c)
   if (!type) return c.json({ message: 'unknown template type' }, 400)
-  const template = await getEmailTemplate(type)
+  const template = await getEmailTemplate(ref, type)
   if (template && template.source_format === 'react') {
     return c.json({ ...template, is_default: false })
   }
@@ -615,17 +662,21 @@ function thirdPartyResponse(integration: ThirdPartyIntegration) {
 }
 
 app.get('/platform/projects/:ref/config/auth/third-party-auth', async (c) => {
-  return c.json((await listIntegrations()).map(thirdPartyResponse))
+  const ref = await resolveAuthRef(c.req.param('ref'))
+  if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
+  return c.json((await listIntegrations(ref)).map(thirdPartyResponse))
 })
 
 app.post('/platform/projects/:ref/config/auth/third-party-auth', async (c) => {
+  const ref = await resolveAuthRef(c.req.param('ref'))
+  if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
   const payload = await c.req.json<{
     oidc_issuer_url?: string | null
     jwks_url?: string | null
     custom_jwks?: unknown
   }>()
   try {
-    const integration = await createIntegration(payload)
+    const integration = await createIntegration(ref, payload)
     return c.json(thirdPartyResponse(integration), 201)
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
@@ -634,13 +685,17 @@ app.post('/platform/projects/:ref/config/auth/third-party-auth', async (c) => {
 })
 
 app.get('/platform/projects/:ref/config/auth/third-party-auth/:id', async (c) => {
-  const integration = await getIntegration(c.req.param('id'))
+  const ref = await resolveAuthRef(c.req.param('ref'))
+  if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
+  const integration = await getIntegration(ref, c.req.param('id'))
   if (!integration) return c.json({ message: 'integration not found' }, 404)
   return c.json(thirdPartyResponse(integration))
 })
 
 app.delete('/platform/projects/:ref/config/auth/third-party-auth/:id', async (c) => {
-  const integration = await deleteIntegration(c.req.param('id'))
+  const ref = await resolveAuthRef(c.req.param('ref'))
+  if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
+  const integration = await deleteIntegration(ref, c.req.param('id'))
   if (!integration) return c.json({ message: 'integration not found' }, 404)
   return c.json(thirdPartyResponse(integration))
 })
@@ -1107,6 +1162,39 @@ app.get('/platform/profile', async (c) => {
   return c.json(identity ?? { username: 'service', role: 'owner' })
 })
 
+// Lets the signed-in dashboard user rotate their own password.
+app.post('/platform/profile/password', async (c) => {
+  const identity = await requestIdentity(c)
+  if (identity === 'invalid') {
+    c.header('Set-Cookie', sessionCookie(null))
+    return c.json({ message: 'session is no longer valid' }, 401)
+  }
+  if (!identity) {
+    return c.json({ message: 'sign in to change your password' }, 401)
+  }
+  const payload = await c
+    .req
+    .json<{ current_password?: string; new_password?: string }>()
+    .catch(() => null)
+  const currentPassword = payload?.current_password
+  const newPassword = payload?.new_password
+  if (typeof currentPassword !== 'string' || currentPassword.length === 0) {
+    return c.json({ message: 'current password is required' }, 400)
+  }
+  if (typeof newPassword !== 'string' || newPassword.length < 8) {
+    return c.json({ message: 'new password must be at least 8 characters' }, 400)
+  }
+  const result = await updateDashboardUserPassword(identity.username, currentPassword, newPassword)
+  if (result === 'not_found') {
+    // The break-glass .env login has no database row; its password lives in .env.
+    return c.json({ message: 'this account is managed via environment variables' }, 400)
+  }
+  if (result === 'wrong_password') {
+    return c.json({ message: 'current password is incorrect' }, 400)
+  }
+  return c.json({})
+})
+
 app.post('/platform/dashboard-users', async (c) => {
   if (!(await canAdminister(c))) {
     return c.json({ message: 'only owners and admins can manage users' }, 403)
@@ -1265,7 +1353,15 @@ app.delete('/platform/dashboard-users/invitations/:id', async (c) => {
 // -- PostgREST configuration --------------------------------------------
 
 app.get('/platform/projects/:ref/config/postgrest', async (c) => {
-  return c.json(await getPostgrestConfig())
+  const ref = c.req.param('ref')
+  const config = await getPostgrestConfig(ref)
+  if (!config) return c.json({ message: 'PostgREST is not available for this project' }, 404)
+  if (ref === 'default') return c.json(config)
+  // Compose projects sign tokens with their own secret; the dashboard's API
+  // settings page reads it from this response, like on the default stack.
+  const project = await getProject(ref)
+  if (project?.secrets) return c.json({ ...config, jwt_secret: project.secrets.jwt_secret })
+  return c.json(config)
 })
 
 app.patch('/platform/projects/:ref/config/postgrest', async (c) => {
@@ -1275,7 +1371,7 @@ app.patch('/platform/projects/:ref/config/postgrest', async (c) => {
     db_extra_search_path?: string
     db_pool?: number | null
   }>()
-  const patch: Parameters<typeof updatePostgrestConfig>[0] = {}
+  const patch: Parameters<typeof updatePostgrestConfig>[1] = {}
   if (payload.db_schema !== undefined) {
     if (typeof payload.db_schema !== 'string') {
       return c.json({ message: 'db_schema must be a string' }, 400)
@@ -1300,13 +1396,17 @@ app.patch('/platform/projects/:ref/config/postgrest', async (c) => {
     }
     patch.db_pool = payload.db_pool
   }
-  return c.json(await updatePostgrestConfig(patch))
+  const updated = await updatePostgrestConfig(c.req.param('ref'), patch)
+  if (!updated) return c.json({ message: 'PostgREST is not available for this project' }, 404)
+  return c.json(updated)
 })
 
 // -- Postgres configuration ---------------------------------------------
 
 app.get('/platform/projects/:ref/config/database/postgres', async (c) => {
-  return c.json(await getPostgresConfig())
+  const config = await getPostgresConfig(c.req.param('ref'))
+  if (!config) return c.json({ message: 'Postgres config is not available for this project' }, 404)
+  return c.json(config)
 })
 
 app.put('/platform/projects/:ref/config/database/postgres', async (c) => {
@@ -1321,7 +1421,10 @@ app.put('/platform/projects/:ref/config/database/postgres', async (c) => {
   }
 
   try {
-    const result = await updatePostgresConfig(patch)
+    const result = await updatePostgresConfig(c.req.param('ref'), patch)
+    if (!result) {
+      return c.json({ message: 'Postgres config is not available for this project' }, 404)
+    }
     return c.json(result.config)
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)

@@ -1,4 +1,7 @@
+import pg from 'pg'
+
 import { env } from './env.js'
+import { getProject, projectDatabaseUrl } from './projects-store.js'
 import { pool } from './store.js'
 
 export type PostgrestConfig = {
@@ -16,21 +19,63 @@ const MANAGED_SETTINGS: Record<string, keyof PostgrestConfig> = {
 }
 
 /**
+ * Compose project PostgREST containers are generated with these env
+ * defaults (see provisioner.ts); the main stack's come from its own env.
+ */
+function envDefaults(ref: string): Omit<PostgrestConfig, 'db_pool'> {
+  if (ref === 'default') {
+    return {
+      db_schema: env.pgrstDbSchemas,
+      max_rows: env.pgrstDbMaxRows,
+      db_extra_search_path: env.pgrstDbExtraSearchPath,
+    }
+  }
+  return { db_schema: 'public,graphql_public,storage', max_rows: 1000, db_extra_search_path: 'public' }
+}
+
+type QueryRunner = (sql: string) => Promise<{ rows: Record<string, unknown>[] }>
+
+/**
+ * Runs queries against the project's own database, where its PostgREST
+ * reads role config and reload notifications. Returns null when the
+ * project has no PostgREST-backing database (unknown ref).
+ */
+async function withProjectDb<T>(
+  ref: string,
+  fn: (query: QueryRunner) => Promise<T>
+): Promise<T | null> {
+  if (ref === 'default') {
+    return fn((sql) => pool.query(sql))
+  }
+  // Only compose projects run their own PostgREST; external ones have none.
+  const project = await getProject(ref)
+  if (!project || project.kind !== 'compose') return null
+  const dbUrl = await projectDatabaseUrl(ref)
+  if (!dbUrl) return null
+  const client = new pg.Client({ connectionString: dbUrl })
+  await client.connect()
+  try {
+    return await fn((sql) => client.query(sql))
+  } finally {
+    await client.end().catch(() => undefined)
+  }
+}
+
+/**
  * Reads the effective PostgREST configuration: in-database settings on the
  * `authenticator` role (which PostgREST re-reads on `NOTIFY pgrst`) override
  * the container's environment defaults.
  */
-export async function getPostgrestConfig(): Promise<PostgrestConfig> {
-  const config: PostgrestConfig = {
-    db_schema: env.pgrstDbSchemas,
-    max_rows: env.pgrstDbMaxRows,
-    db_extra_search_path: env.pgrstDbExtraSearchPath,
-    db_pool: null,
-  }
+export async function getPostgrestConfig(ref: string): Promise<PostgrestConfig | null> {
+  const config: PostgrestConfig = { ...envDefaults(ref), db_pool: null }
 
-  const { rows } = await pool.query(
-    `select coalesce(rolconfig, '{}') as rolconfig from pg_roles where rolname = 'authenticator'`
+  const result = await withProjectDb(ref, (query) =>
+    query(
+      `select coalesce(rolconfig, '{}') as rolconfig from pg_roles where rolname = 'authenticator'`
+    )
   )
+  if (result === null) return null
+  const { rows } = result as { rows: { rolconfig: string[] }[] }
   const rolconfig: string[] = rows[0]?.rolconfig ?? []
   for (const entry of rolconfig) {
     const eq = entry.indexOf('=')
@@ -56,47 +101,51 @@ function quoteLiteral(value: string): string {
  * role and asks PostgREST to reload, so changes take effect without editing
  * env vars or restarting the container.
  */
-export async function updatePostgrestConfig(patch: {
-  db_schema?: string
-  max_rows?: number
-  db_extra_search_path?: string
-  db_pool?: number | null
-}): Promise<PostgrestConfig> {
-  const client = await pool.connect()
-  try {
-    await client.query('begin')
-    if (patch.db_schema !== undefined) {
-      await client.query(
-        `alter role authenticator set pgrst.db_schemas = ${quoteLiteral(patch.db_schema)}`
-      )
-    }
-    if (patch.max_rows !== undefined) {
-      await client.query(
-        `alter role authenticator set pgrst.db_max_rows = ${quoteLiteral(String(patch.max_rows))}`
-      )
-    }
-    if (patch.db_extra_search_path !== undefined) {
-      await client.query(
-        `alter role authenticator set pgrst.db_extra_search_path = ${quoteLiteral(patch.db_extra_search_path)}`
-      )
-    }
-    if (patch.db_pool !== undefined) {
-      if (patch.db_pool === null) {
-        await client.query(`alter role authenticator reset pgrst.db_pool`)
-      } else {
-        await client.query(
-          `alter role authenticator set pgrst.db_pool = ${quoteLiteral(String(patch.db_pool))}`
+export async function updatePostgrestConfig(
+  ref: string,
+  patch: {
+    db_schema?: string
+    max_rows?: number
+    db_extra_search_path?: string
+    db_pool?: number | null
+  }
+): Promise<PostgrestConfig | null> {
+  const applied = await withProjectDb(ref, async (query) => {
+    await query('begin')
+    try {
+      if (patch.db_schema !== undefined) {
+        await query(
+          `alter role authenticator set pgrst.db_schemas = ${quoteLiteral(patch.db_schema)}`
         )
       }
+      if (patch.max_rows !== undefined) {
+        await query(
+          `alter role authenticator set pgrst.db_max_rows = ${quoteLiteral(String(patch.max_rows))}`
+        )
+      }
+      if (patch.db_extra_search_path !== undefined) {
+        await query(
+          `alter role authenticator set pgrst.db_extra_search_path = ${quoteLiteral(patch.db_extra_search_path)}`
+        )
+      }
+      if (patch.db_pool !== undefined) {
+        if (patch.db_pool === null) {
+          await query(`alter role authenticator reset pgrst.db_pool`)
+        } else {
+          await query(
+            `alter role authenticator set pgrst.db_pool = ${quoteLiteral(String(patch.db_pool))}`
+          )
+        }
+      }
+      await query('commit')
+    } catch (err) {
+      await query('rollback')
+      throw err
     }
-    await client.query('commit')
-  } catch (err) {
-    await client.query('rollback')
-    throw err
-  } finally {
-    client.release()
-  }
+    await query(`notify pgrst, 'reload config'`)
+    return true
+  })
+  if (applied === null) return null
 
-  await pool.query(`notify pgrst, 'reload config'`)
-  return getPostgrestConfig()
+  return getPostgrestConfig(ref)
 }

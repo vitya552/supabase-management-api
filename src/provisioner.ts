@@ -17,7 +17,9 @@ import {
   type ProjectSecrets,
   updateProjectStatus,
 } from './projects-store.js'
-import { deleteProjectFunctionData } from './store.js'
+import { syncEnvFile } from './envfile.js'
+import { deleteProjectAuthData, deleteProjectFunctionData } from './store.js'
+import { deleteProjectIntegrations, syncThirdPartyJwks } from './third-party-auth.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -149,16 +151,24 @@ services:
       PGRST_DB_EXTRA_SEARCH_PATH: public
       PGRST_DB_MAX_ROWS: 1000
       PGRST_DB_ANON_ROLE: anon
-      PGRST_JWT_SECRET: \${JWT_SECRET}
+      PGRST_JWT_SECRET: "@/etc/postgrest-runtime/jwks.json"
       PGRST_DB_USE_LEGACY_GUCS: "false"
       PGRST_APP_SETTINGS_JWT_SECRET: \${JWT_SECRET}
       PGRST_APP_SETTINGS_JWT_EXP: 3600
+    volumes:
+      # Trusted JWK set (project keys + third-party auth), managed by
+      # management-api and picked up on config reload.
+      - ${dir}/postgrest:/etc/postgrest-runtime:ro,z
     command: ["postgrest"]
 
   ${name('auth')}:
     container_name: ${name('auth')}
     image: ${env.projectImages.gotrue}
     restart: unless-stopped
+    # --config-dir makes GoTrue live-reload .env files written by management-api
+    command: ["auth", "--config-dir", "/etc/auth"]
+    volumes:
+      - ${dir}/auth-config:/etc/auth:z
     depends_on:
       ${name('db')}:
         condition: service_healthy
@@ -302,6 +312,8 @@ async function writeProjectFiles(ref: string, secrets: ProjectSecrets, dbPort: n
   await mkdir(path.join(dir, 'db-data'), { recursive: true })
   await mkdir(path.join(dir, 'storage'), { recursive: true })
   await mkdir(path.join(dir, 'functions'), { recursive: true })
+  await mkdir(path.join(dir, 'auth-config'), { recursive: true })
+  await mkdir(path.join(dir, 'postgrest'), { recursive: true })
 
   for (const file of DB_INIT_FILES) {
     await copyFile(path.join(env.dbInitDir, file), path.join(dir, 'db-init', file))
@@ -352,6 +364,10 @@ export async function provisionProject(input: {
   void (async () => {
     try {
       await writeProjectFiles(ref, secrets, dbPort)
+      // Materialize the project's runtime auth config and trusted JWK set
+      // before the containers that mount them start.
+      await syncEnvFile(ref)
+      await syncThirdPartyJwks(ref)
       await compose(ref, ['--env-file', path.join(projectDir(ref), '.env'), 'up', '-d'])
       await updateProjectStatus(ref, 'ACTIVE_HEALTHY')
     } catch (err) {
@@ -379,6 +395,12 @@ export async function deprovisionProject(ref: string): Promise<void> {
   } finally {
     await deleteProjectFunctionData(ref).catch((err) => {
       console.error(`deleting function data for ${ref} failed:`, err)
+    })
+    await deleteProjectAuthData(ref).catch((err) => {
+      console.error(`deleting auth data for ${ref} failed:`, err)
+    })
+    await deleteProjectIntegrations(ref).catch((err) => {
+      console.error(`deleting third-party auth for ${ref} failed:`, err)
     })
     await deleteProjectRecord(ref)
   }
