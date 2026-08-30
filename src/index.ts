@@ -54,6 +54,7 @@ import {
 import { isSmtpConfigured, sendInvitationEmail } from './mailer.js'
 import { handleProjectUpgrade, proxyProjectRequest } from './project-proxy.js'
 import { getRealtimeConfig, updateRealtimeConfig } from './realtime-config.js'
+import { getS3ProtocolInfo, getStorageConfig } from './storage-config.js'
 import {
   createOrganization,
   createProjectRecord,
@@ -1036,6 +1037,27 @@ app.delete('/platform/projects/:ref', async (c) => {
 // Per-project API traffic (rest/auth/storage/functions), routed here by the
 // gateway. The project's own services authenticate each request.
 app.all('/proj/:ref/*', proxyProjectRequest)
+
+// -- Storage configuration --------------------------------------------------
+
+app.get('/platform/projects/:ref/config/storage', async (c) => {
+  const config = await getStorageConfig(c.req.param('ref'))
+  if (config === null) {
+    return c.json({ message: 'Storage is not available for this project' }, 404)
+  }
+  return c.json(config)
+})
+
+app.get('/platform/storage/:ref/s3-protocol', async (c) => {
+  if (!(await canAdminister(c))) {
+    return c.json({ message: 'only owners and admins can view S3 credentials' }, 403)
+  }
+  const info = await getS3ProtocolInfo(c.req.param('ref'))
+  if (info === null) {
+    return c.json({ message: 'Storage is not available for this project' }, 404)
+  }
+  return c.json(info)
+})
 
 // -- Realtime configuration -------------------------------------------------
 

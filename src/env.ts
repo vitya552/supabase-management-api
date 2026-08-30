@@ -99,6 +99,12 @@ export const env = {
   realtimeHost: process.env.REALTIME_HOST ?? 'realtime-dev.supabase-realtime',
   realtimePort: Number(process.env.REALTIME_PORT ?? 4000),
 
+  /** Mirrors of the storage service's env, reported via the config API. */
+  storageFileSizeLimit: Number(process.env.STORAGE_FILE_SIZE_LIMIT ?? 52428800),
+  storageVectorsEnabled: (process.env.STORAGE_VECTOR_ENABLED ?? 'true') === 'true',
+  s3ProtocolAccessKeyId: process.env.S3_PROTOCOL_ACCESS_KEY_ID ?? '',
+  s3ProtocolAccessKeySecret: process.env.S3_PROTOCOL_ACCESS_KEY_SECRET ?? '',
+
   /** Images used for per-project stacks; keep in sync with docker-compose.yml. */
   projectImages: {
     postgres: process.env.PROJECT_POSTGRES_IMAGE ?? 'supabase/postgres:17.6.1.136',

@@ -19,6 +19,9 @@ export type ProjectSecrets = {
   service_role_key: string
   /** Absent on projects provisioned before Realtime support. */
   secret_key_base?: string
+  /** Absent on projects provisioned before S3 protocol support. */
+  s3_access_key_id?: string
+  s3_access_key_secret?: string
 }
 
 export type ProjectRecord = {

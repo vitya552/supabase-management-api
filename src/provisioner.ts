@@ -206,6 +206,12 @@ services:
       TENANT_ID: \${REF}
       REGION: local
       ENABLE_IMAGE_TRANSFORMATION: "false"
+      VECTOR_ENABLED: "true"
+      VECTOR_BUCKET_PROVIDER: pgvector
+      VECTOR_DATABASE_URL: postgres://supabase_storage_admin:\${POSTGRES_PASSWORD}@${name('db')}:5432/postgres
+      VECTOR_STORE_MIGRATIONS_ENABLED: "true"
+      S3_PROTOCOL_ACCESS_KEY_ID: \${S3_PROTOCOL_ACCESS_KEY_ID}
+      S3_PROTOCOL_ACCESS_KEY_SECRET: \${S3_PROTOCOL_ACCESS_KEY_SECRET}
     volumes:
       - ${dir}/storage:/var/lib/storage:z
 
@@ -270,6 +276,8 @@ function envFile(ref: string, secrets: ProjectSecrets): string {
     `ANON_KEY=${secrets.anon_key}`,
     `SERVICE_ROLE_KEY=${secrets.service_role_key}`,
     `SECRET_KEY_BASE=${secrets.secret_key_base ?? randomBytes(32).toString('hex')}`,
+    `S3_PROTOCOL_ACCESS_KEY_ID=${secrets.s3_access_key_id ?? ''}`,
+    `S3_PROTOCOL_ACCESS_KEY_SECRET=${secrets.s3_access_key_secret ?? ''}`,
     `SITE_URL=${env.publicUrl}`,
     `API_EXTERNAL_URL=${publicBase}/auth/v1`,
     `STORAGE_PUBLIC_URL=${publicBase}`,
@@ -315,6 +323,8 @@ export function generateProjectSecrets(): ProjectSecrets {
     anon_key: mintApiKey('anon', jwtSecret),
     service_role_key: mintApiKey('service_role', jwtSecret),
     secret_key_base: randomBytes(32).toString('hex'),
+    s3_access_key_id: randomBytes(16).toString('hex'),
+    s3_access_key_secret: randomBytes(32).toString('hex'),
   }
 }
 
