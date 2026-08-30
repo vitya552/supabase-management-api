@@ -3,6 +3,7 @@ import { describe, it } from 'node:test'
 
 process.env.DATABASE_URL ??= 'postgres://unused'
 process.env.MANAGEMENT_API_TOKEN ??= 'unused'
+process.env.VAULT_ENC_KEY ??= 'test-encryption-key'
 
 const { isManagedGuc, validateGucValue } = await import('../src/postgres-config.js')
 

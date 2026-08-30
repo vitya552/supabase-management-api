@@ -53,4 +53,10 @@ export const env = {
    */
   dashboardUsername: process.env.DASHBOARD_USERNAME ?? '',
   dashboardPassword: process.env.DASHBOARD_PASSWORD ?? '',
+
+  /**
+   * Key used to encrypt secret values at rest (AES-256-GCM). Falls back to
+   * VAULT_ENC_KEY so the standard self-hosted .env works out of the box.
+   */
+  encryptionKey: process.env.MANAGEMENT_ENC_KEY || required('VAULT_ENC_KEY'),
 }

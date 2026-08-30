@@ -4,6 +4,7 @@ import { test } from 'node:test'
 
 process.env.DATABASE_URL ??= 'postgres://test'
 process.env.MANAGEMENT_API_TOKEN ??= 'test-token'
+process.env.VAULT_ENC_KEY ??= 'test-encryption-key'
 
 const { renderReactEmail } = await import('../src/emails.js')
 

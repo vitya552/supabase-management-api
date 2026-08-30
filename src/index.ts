@@ -1,6 +1,7 @@
 import { serve } from '@hono/node-server'
 import { Hono } from 'hono'
 import { logger } from 'hono/logger'
+import { createHash } from 'node:crypto'
 
 import { AUTH_CONFIG_KEYS } from './auth-config-keys.js'
 import { baselineConfig } from './baseline.js'
@@ -10,7 +11,6 @@ import {
   isValidBasicAuthHeader,
   isValidCredentials,
   isValidSessionToken,
-  renderLoginPage,
   sanitizeRedirectPath,
   SESSION_COOKIE,
 } from './dashboard-auth.js'
@@ -320,11 +320,12 @@ app.use('/platform/projects/:ref/secrets', async (c, next) => {
 
 app.get('/platform/projects/:ref/secrets', async (c) => {
   const secrets = await getFunctionSecrets()
-  // Secret values are write-only through the API: the list response only
-  // exposes names and metadata.
+  // Secret values are write-only through the API: the list response exposes
+  // a SHA256 digest of each value, matching the hosted platform contract.
   return c.json(
     secrets.map((secret) => ({
       name: secret.name,
+      value: createHash('sha256').update(secret.value).digest('hex'),
       updated_at: new Date(secret.updated_at).toISOString(),
     }))
   )
@@ -415,8 +416,8 @@ app.delete('/platform/projects/:ref/config/auth/third-party-auth/:id', async (c)
 
 // -- Dashboard authentication ---------------------------------------------
 //
-// Serves a real login page for the dashboard and validates sessions for the
-// gateway's ext_authz filter, replacing the browser Basic Auth prompt.
+// Validates dashboard sessions for the gateway. The login UI itself is
+// Studio's /sign-in page, which posts credentials here as JSON.
 
 app.get('/dashboard-auth/check', (c) => {
   const cookie = c.req.header('cookie') ?? ''
@@ -429,30 +430,30 @@ app.get('/dashboard-auth/check', (c) => {
 })
 
 app.get('/dashboard-auth/login', (c) => {
+  // Legacy entrypoint: the login UI now lives on Studio's own sign-in page.
   const redirectTo = sanitizeRedirectPath(c.req.query('redirect_to'))
-  return c.html(renderLoginPage({ redirectTo }))
+  return c.redirect(`/sign-in?returnTo=${encodeURIComponent(redirectTo)}`, 302)
 })
 
 app.post('/dashboard-auth/login', async (c) => {
-  const form = await c.req.formData()
-  const username = String(form.get('username') ?? '')
-  const password = String(form.get('password') ?? '')
-  const redirectTo = sanitizeRedirectPath(String(form.get('redirect_to') ?? '/'))
+  const payload = await c.req.json<{ username?: string; password?: string }>().catch(() => null)
+  const username = payload?.username ?? ''
+  const password = payload?.password ?? ''
 
   if (!isValidCredentials(username, password)) {
-    return c.html(renderLoginPage({ redirectTo, errorMessage: 'Invalid username or password' }), 401)
+    return c.json({ message: 'Invalid username or password' }, 401)
   }
 
   c.header(
     'Set-Cookie',
     `${SESSION_COOKIE}=${createSessionToken()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800`
   )
-  return c.redirect(redirectTo, 303)
+  return c.json({ message: 'ok' })
 })
 
 app.post('/dashboard-auth/logout', (c) => {
   c.header('Set-Cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`)
-  return c.redirect('/dashboard-auth/login', 303)
+  return c.json({ message: 'ok' })
 })
 
 // -- PostgREST configuration --------------------------------------------

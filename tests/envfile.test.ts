@@ -3,6 +3,7 @@ import { test } from 'node:test'
 
 process.env.DATABASE_URL ??= 'postgres://test'
 process.env.MANAGEMENT_API_TOKEN ??= 'test-token'
+process.env.VAULT_ENC_KEY ??= 'test-encryption-key'
 process.env.SELF_URL ??= 'http://management-api:8085'
 process.env.API_EXTERNAL_URL ??= 'http://localhost:8000'
 

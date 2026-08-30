@@ -3,6 +3,7 @@ import { describe, it } from 'node:test'
 
 process.env.MANAGEMENT_API_TOKEN = process.env.MANAGEMENT_API_TOKEN || 'test-token'
 process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://localhost:5432/test'
+process.env.VAULT_ENC_KEY = process.env.VAULT_ENC_KEY || 'test-encryption-key'
 process.env.DASHBOARD_USERNAME = 'admin'
 process.env.DASHBOARD_PASSWORD = 'test-password'
 

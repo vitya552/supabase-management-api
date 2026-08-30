@@ -1,5 +1,6 @@
 import pg from 'pg'
 
+import { decryptString, encryptString, isEncrypted, isSensitiveConfigKey } from './crypto.js'
 import { env } from './env.js'
 
 export const pool = new pg.Pool({ connectionString: env.databaseUrl })
@@ -37,6 +38,33 @@ export async function migrate(): Promise<void> {
       updated_at timestamptz not null default now()
     );
   `)
+  await encryptLegacyPlaintextRows()
+}
+
+/** One-time upgrade: encrypt rows written before encryption at rest existed. */
+async function encryptLegacyPlaintextRows(): Promise<void> {
+  const { rows: secretRows } = await pool.query(
+    'select name, value from management.function_secrets'
+  )
+  for (const row of secretRows) {
+    if (!isEncrypted(row.value)) {
+      await pool.query(
+        'update management.function_secrets set value = $2 where name = $1',
+        [row.name, encryptString(row.value)]
+      )
+    }
+  }
+
+  const { rows: configRows } = await pool.query('select key, value from management.auth_config')
+  for (const row of configRows) {
+    if (!isSensitiveConfigKey(row.key)) continue
+    const value = row.value
+    if (typeof value === 'string' && isEncrypted(value)) continue
+    await pool.query('update management.auth_config set value = $2::jsonb where key = $1', [
+      row.key,
+      JSON.stringify(encryptString(JSON.stringify(value))),
+    ])
+  }
 }
 
 export type EdgeFunctionRecord = {
@@ -109,7 +137,7 @@ export type FunctionSecret = { name: string; value: string; updated_at: Date }
 
 export async function getFunctionSecrets(): Promise<FunctionSecret[]> {
   const { rows } = await pool.query('select * from management.function_secrets order by name')
-  return rows
+  return rows.map((row) => ({ ...row, value: decryptString(row.value) }))
 }
 
 export async function upsertFunctionSecrets(
@@ -123,7 +151,7 @@ export async function upsertFunctionSecrets(
       await client.query(
         `insert into management.function_secrets (name, value) values ($1, $2)
          on conflict (name) do update set value = excluded.value, updated_at = now()`,
-        [secret.name, secret.value]
+        [secret.name, encryptString(secret.value)]
       )
     }
     await client.query('commit')
@@ -143,7 +171,14 @@ export async function deleteFunctionSecrets(names: string[]): Promise<void> {
 export async function getAllConfig(): Promise<Record<string, ConfigValue>> {
   const { rows } = await pool.query('select key, value from management.auth_config')
   const out: Record<string, ConfigValue> = {}
-  for (const row of rows) out[row.key] = row.value
+  for (const row of rows) {
+    const value = row.value
+    if (typeof value === 'string' && isEncrypted(value)) {
+      out[row.key] = JSON.parse(decryptString(value))
+    } else {
+      out[row.key] = value
+    }
+  }
   return out
 }
 
@@ -158,10 +193,13 @@ export async function upsertConfig(entries: Record<string, ConfigValue>): Promis
       if (value === null) {
         await client.query('delete from management.auth_config where key = $1', [key])
       } else {
+        const serialized = isSensitiveConfigKey(key)
+          ? JSON.stringify(encryptString(JSON.stringify(value)))
+          : JSON.stringify(value)
         await client.query(
           `insert into management.auth_config (key, value) values ($1, $2::jsonb)
            on conflict (key) do update set value = excluded.value, updated_at = now()`,
-          [key, JSON.stringify(value)]
+          [key, serialized]
         )
       }
     }
