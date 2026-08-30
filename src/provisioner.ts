@@ -16,6 +16,7 @@ import {
   type ProjectSecrets,
   updateProjectStatus,
 } from './projects-store.js'
+import { deleteProjectFunctionData } from './store.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -324,6 +325,9 @@ export async function deprovisionProject(ref: string): Promise<void> {
       await rm(projectDir(ref), { recursive: true, force: true })
     }
   } finally {
+    await deleteProjectFunctionData(ref).catch((err) => {
+      console.error(`deleting function data for ${ref} failed:`, err)
+    })
     await deleteProjectRecord(ref)
   }
 }

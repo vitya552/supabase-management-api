@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 export type FunctionFile = { name: string; content: string }
@@ -94,6 +94,40 @@ export async function writeManifestFile(
   const tmp = `${target}.tmp`
   await writeFile(tmp, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
   await rename(tmp, target)
+}
+
+export type FunctionFileEntry = { relativePath: string; absolutePath: string; size: number }
+
+/** Recursively lists a deployed function's files under `<functionsDir>/<slug>/`. */
+export async function listFunctionFiles(
+  functionsDir: string,
+  slug: string
+): Promise<FunctionFileEntry[]> {
+  if (!isValidSlug(slug)) throw new Error(`invalid function slug: ${slug}`)
+  const base = path.join(functionsDir, slug)
+  const entries: FunctionFileEntry[] = []
+  async function walk(dir: string): Promise<void> {
+    const names = await readdir(dir, { withFileTypes: true })
+    for (const entry of names) {
+      const abs = path.join(dir, entry.name)
+      if (entry.isDirectory()) {
+        await walk(abs)
+      } else if (entry.isFile()) {
+        const info = await stat(abs)
+        entries.push({
+          relativePath: path.relative(base, abs),
+          absolutePath: abs,
+          size: info.size,
+        })
+      }
+    }
+  }
+  try {
+    await walk(base)
+  } catch {
+    return []
+  }
+  return entries
 }
 
 export async function readSecretsFile(functionsDir: string): Promise<Record<string, string>> {

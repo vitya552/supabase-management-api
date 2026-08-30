@@ -37,6 +37,26 @@ export async function migrate(): Promise<void> {
       value text not null,
       updated_at timestamptz not null default now()
     );
+    alter table management.edge_functions
+      add column if not exists project_ref text not null default 'default';
+    alter table management.function_secrets
+      add column if not exists project_ref text not null default 'default';
+    do $$ begin
+      if not exists (
+        select 1 from pg_constraint where conname = 'edge_functions_project_ref_slug_key'
+      ) then
+        alter table management.edge_functions drop constraint edge_functions_pkey;
+        alter table management.edge_functions
+          add constraint edge_functions_project_ref_slug_key primary key (project_ref, slug);
+      end if;
+      if not exists (
+        select 1 from pg_constraint where conname = 'function_secrets_project_ref_name_key'
+      ) then
+        alter table management.function_secrets drop constraint function_secrets_pkey;
+        alter table management.function_secrets
+          add constraint function_secrets_project_ref_name_key primary key (project_ref, name);
+      end if;
+    end $$;
   `)
   await encryptLegacyPlaintextRows()
 }
@@ -78,29 +98,39 @@ export type EdgeFunctionRecord = {
   updated_at: Date
 }
 
-export async function getEdgeFunctions(): Promise<EdgeFunctionRecord[]> {
-  const { rows } = await pool.query('select * from management.edge_functions order by slug')
+export async function getEdgeFunctions(projectRef: string): Promise<EdgeFunctionRecord[]> {
+  const { rows } = await pool.query(
+    'select * from management.edge_functions where project_ref = $1 order by slug',
+    [projectRef]
+  )
   return rows
 }
 
-export async function getEdgeFunction(slug: string): Promise<EdgeFunctionRecord | null> {
-  const { rows } = await pool.query('select * from management.edge_functions where slug = $1', [
-    slug,
-  ])
+export async function getEdgeFunction(
+  projectRef: string,
+  slug: string
+): Promise<EdgeFunctionRecord | null> {
+  const { rows } = await pool.query(
+    'select * from management.edge_functions where project_ref = $1 and slug = $2',
+    [projectRef, slug]
+  )
   return rows[0] ?? null
 }
 
-export async function upsertEdgeFunction(fn: {
-  slug: string
-  name: string
-  verify_jwt: boolean
-  entrypoint_path: string | null
-  import_map_path: string | null
-}): Promise<EdgeFunctionRecord> {
+export async function upsertEdgeFunction(
+  projectRef: string,
+  fn: {
+    slug: string
+    name: string
+    verify_jwt: boolean
+    entrypoint_path: string | null
+    import_map_path: string | null
+  }
+): Promise<EdgeFunctionRecord> {
   const { rows } = await pool.query(
-    `insert into management.edge_functions (slug, name, verify_jwt, entrypoint_path, import_map_path)
-     values ($1, $2, $3, $4, $5)
-     on conflict (slug) do update
+    `insert into management.edge_functions (project_ref, slug, name, verify_jwt, entrypoint_path, import_map_path)
+     values ($1, $2, $3, $4, $5, $6)
+     on conflict (project_ref, slug) do update
        set name = excluded.name,
            verify_jwt = excluded.verify_jwt,
            entrypoint_path = excluded.entrypoint_path,
@@ -108,35 +138,48 @@ export async function upsertEdgeFunction(fn: {
            version = management.edge_functions.version + 1,
            updated_at = now()
      returning *`,
-    [fn.slug, fn.name, fn.verify_jwt, fn.entrypoint_path, fn.import_map_path]
+    [projectRef, fn.slug, fn.name, fn.verify_jwt, fn.entrypoint_path, fn.import_map_path]
   )
   return rows[0]
 }
 
 export async function updateEdgeFunction(
+  projectRef: string,
   slug: string,
   patch: { name?: string; verify_jwt?: boolean }
 ): Promise<EdgeFunctionRecord | null> {
   const { rows } = await pool.query(
     `update management.edge_functions
-       set name = coalesce($2, name),
-           verify_jwt = coalesce($3, verify_jwt),
+       set name = coalesce($3, name),
+           verify_jwt = coalesce($4, verify_jwt),
            updated_at = now()
-     where slug = $1
+     where project_ref = $1 and slug = $2
      returning *`,
-    [slug, patch.name ?? null, patch.verify_jwt ?? null]
+    [projectRef, slug, patch.name ?? null, patch.verify_jwt ?? null]
   )
   return rows[0] ?? null
 }
 
-export async function deleteEdgeFunction(slug: string): Promise<void> {
-  await pool.query('delete from management.edge_functions where slug = $1', [slug])
+export async function deleteEdgeFunction(projectRef: string, slug: string): Promise<void> {
+  await pool.query(
+    'delete from management.edge_functions where project_ref = $1 and slug = $2',
+    [projectRef, slug]
+  )
+}
+
+/** Removes all function rows belonging to a project (used on deprovision). */
+export async function deleteProjectFunctionData(projectRef: string): Promise<void> {
+  await pool.query('delete from management.edge_functions where project_ref = $1', [projectRef])
+  await pool.query('delete from management.function_secrets where project_ref = $1', [projectRef])
 }
 
 export type FunctionSecret = { name: string; value: string; updated_at: Date }
 
-export async function getFunctionSecrets(): Promise<FunctionSecret[]> {
-  const { rows } = await pool.query('select * from management.function_secrets order by name')
+export async function getFunctionSecrets(projectRef: string): Promise<FunctionSecret[]> {
+  const { rows } = await pool.query(
+    'select * from management.function_secrets where project_ref = $1 order by name',
+    [projectRef]
+  )
   return rows.map((row) => ({
     ...row,
     value: isEncrypted(row.value) ? decryptString(row.value, row.name) : row.value,
@@ -144,6 +187,7 @@ export async function getFunctionSecrets(): Promise<FunctionSecret[]> {
 }
 
 export async function upsertFunctionSecrets(
+  projectRef: string,
   secrets: Array<{ name: string; value: string }>
 ): Promise<void> {
   if (secrets.length === 0) return
@@ -152,9 +196,9 @@ export async function upsertFunctionSecrets(
     await client.query('begin')
     for (const secret of secrets) {
       await client.query(
-        `insert into management.function_secrets (name, value) values ($1, $2)
-         on conflict (name) do update set value = excluded.value, updated_at = now()`,
-        [secret.name, encryptString(secret.value, secret.name)]
+        `insert into management.function_secrets (project_ref, name, value) values ($1, $2, $3)
+         on conflict (project_ref, name) do update set value = excluded.value, updated_at = now()`,
+        [projectRef, secret.name, encryptString(secret.value, secret.name)]
       )
     }
     await client.query('commit')
@@ -166,9 +210,12 @@ export async function upsertFunctionSecrets(
   }
 }
 
-export async function deleteFunctionSecrets(names: string[]): Promise<void> {
+export async function deleteFunctionSecrets(projectRef: string, names: string[]): Promise<void> {
   if (names.length === 0) return
-  await pool.query('delete from management.function_secrets where name = any($1)', [names])
+  await pool.query(
+    'delete from management.function_secrets where project_ref = $1 and name = any($2)',
+    [projectRef, names]
+  )
 }
 
 export async function getAllConfig(): Promise<Record<string, ConfigValue>> {

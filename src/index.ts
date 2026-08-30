@@ -2,6 +2,8 @@ import { serve } from '@hono/node-server'
 import { Hono } from 'hono'
 import { logger } from 'hono/logger'
 import { createHash, timingSafeEqual } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
 import pg from 'pg'
 
 import { AUTH_CONFIG_KEYS } from './auth-config-keys.js'
@@ -42,6 +44,7 @@ import {
   deleteFunctionFiles,
   type FunctionFile,
   isValidSlug,
+  listFunctionFiles,
   writeFunctionFiles,
   writeManifestFile,
   writeSecretsFile,
@@ -299,9 +302,32 @@ app.get('/platform/auth/:ref/templates/:template/react', async (c) => {
 const MAX_FUNCTION_FILES = 100
 const MAX_FUNCTION_BYTES = 10 * 1024 * 1024
 
+/**
+ * Resolves the on-disk functions directory for a project. The default stack
+ * uses the shared FUNCTIONS_DIR volume; compose projects have their own
+ * `functions/` directory inside the project folder; external projects have no
+ * edge runtime at all.
+ */
+async function resolveFunctionsDir(
+  ref: string
+): Promise<{ dir: string } | { message: string; status: 404 | 501 }> {
+  if (ref === 'default') {
+    if (!env.functionsDir) {
+      return { message: 'edge functions management is not configured (FUNCTIONS_DIR)', status: 501 }
+    }
+    return { dir: env.functionsDir }
+  }
+  const project = await getProject(ref)
+  if (!project) return { message: `project ${ref} not found`, status: 404 }
+  if (project.kind !== 'compose') {
+    return { message: 'this project has no edge functions runtime', status: 501 }
+  }
+  return { dir: path.join(env.projectsDir, ref, 'functions') }
+}
+
 /** Republishes per-function settings the `main` dispatcher enforces. */
-async function syncFunctionManifest() {
-  await writeManifestFile(env.functionsDir, await getEdgeFunctions())
+async function syncFunctionManifest(ref: string, dir: string) {
+  await writeManifestFile(dir, await getEdgeFunctions(ref))
 }
 
 function functionResponse(fn: EdgeFunctionRecord) {
@@ -319,18 +345,17 @@ function functionResponse(fn: EdgeFunctionRecord) {
   }
 }
 
-app.use('/platform/projects/:ref/functions/*', async (c, next) => {
-  if (!env.functionsDir) {
-    return c.json({ message: 'edge functions management is not configured (FUNCTIONS_DIR)' }, 501)
-  }
-  await next()
-})
-
 app.get('/platform/projects/:ref/functions', async (c) => {
-  return c.json((await getEdgeFunctions()).map(functionResponse))
+  const ref = c.req.param('ref')
+  const resolved = await resolveFunctionsDir(ref)
+  if ('status' in resolved) return c.json({ message: resolved.message }, resolved.status)
+  return c.json((await getEdgeFunctions(ref)).map(functionResponse))
 })
 
 app.post('/platform/projects/:ref/functions/deploy', async (c) => {
+  const ref = c.req.param('ref')
+  const resolved = await resolveFunctionsDir(ref)
+  if ('status' in resolved) return c.json({ message: resolved.message }, resolved.status)
   const slug = (c.req.query('slug') ?? '').toLowerCase()
   if (!isValidSlug(slug)) return c.json({ message: `invalid function slug: ${slug}` }, 400)
 
@@ -367,64 +392,87 @@ app.post('/platform/projects/:ref/functions/deploy', async (c) => {
   if (files.length === 0) return c.json({ message: 'at least one file is required' }, 400)
 
   try {
-    await writeFunctionFiles(env.functionsDir, slug, files)
+    await writeFunctionFiles(resolved.dir, slug, files)
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     return c.json({ message }, 400)
   }
 
-  const fn = await upsertEdgeFunction({
+  const fn = await upsertEdgeFunction(ref, {
     slug,
     name: metadata.name ?? slug,
     verify_jwt: metadata.verify_jwt ?? true,
     entrypoint_path: metadata.entrypoint_path ?? null,
     import_map_path: metadata.import_map_path ?? null,
   })
-  await syncFunctionManifest()
+  await syncFunctionManifest(ref, resolved.dir)
   return c.json(functionResponse(fn))
 })
 
 app.get('/platform/projects/:ref/functions/:slug', async (c) => {
-  const fn = await getEdgeFunction(c.req.param('slug'))
+  const ref = c.req.param('ref')
+  const resolved = await resolveFunctionsDir(ref)
+  if ('status' in resolved) return c.json({ message: resolved.message }, resolved.status)
+  const fn = await getEdgeFunction(ref, c.req.param('slug'))
   if (!fn) return c.json({ message: 'function not found' }, 404)
   return c.json(functionResponse(fn))
 })
 
-app.patch('/platform/projects/:ref/functions/:slug', async (c) => {
-  const payload = await c.req.json<{ name?: string; verify_jwt?: boolean }>()
-  const fn = await updateEdgeFunction(c.req.param('slug'), payload)
+app.get('/platform/projects/:ref/functions/:slug/files', async (c) => {
+  const ref = c.req.param('ref')
+  const resolved = await resolveFunctionsDir(ref)
+  if ('status' in resolved) return c.json({ message: resolved.message }, resolved.status)
+  const slug = c.req.param('slug')
+  if (!isValidSlug(slug)) return c.json({ message: `invalid function slug: ${slug}` }, 400)
+  const fn = await getEdgeFunction(ref, slug)
   if (!fn) return c.json({ message: 'function not found' }, 404)
-  await syncFunctionManifest()
+  const entries = await listFunctionFiles(resolved.dir, slug)
+  const files = await Promise.all(
+    entries.map(async (entry) => ({
+      name: entry.relativePath,
+      content: await readFile(entry.absolutePath, 'utf8'),
+    }))
+  )
+  return c.json({ files })
+})
+
+app.patch('/platform/projects/:ref/functions/:slug', async (c) => {
+  const ref = c.req.param('ref')
+  const resolved = await resolveFunctionsDir(ref)
+  if ('status' in resolved) return c.json({ message: resolved.message }, resolved.status)
+  const payload = await c.req.json<{ name?: string; verify_jwt?: boolean }>()
+  const fn = await updateEdgeFunction(ref, c.req.param('slug'), payload)
+  if (!fn) return c.json({ message: 'function not found' }, 404)
+  await syncFunctionManifest(ref, resolved.dir)
   return c.json(functionResponse(fn))
 })
 
 app.delete('/platform/projects/:ref/functions/:slug', async (c) => {
+  const ref = c.req.param('ref')
+  const resolved = await resolveFunctionsDir(ref)
+  if ('status' in resolved) return c.json({ message: resolved.message }, resolved.status)
   const slug = c.req.param('slug')
   if (!isValidSlug(slug)) return c.json({ message: `invalid function slug: ${slug}` }, 400)
-  await deleteFunctionFiles(env.functionsDir, slug)
-  await deleteEdgeFunction(slug)
-  await syncFunctionManifest()
+  await deleteFunctionFiles(resolved.dir, slug)
+  await deleteEdgeFunction(ref, slug)
+  await syncFunctionManifest(ref, resolved.dir)
   return c.json({ slug })
 })
 
 // -- Edge Function secrets ----------------------------------------------
 
-async function syncSecretsFile() {
-  const secrets = await getFunctionSecrets()
+async function syncSecretsFile(ref: string, dir: string) {
+  const secrets = await getFunctionSecrets(ref)
   const out: Record<string, string> = {}
   for (const secret of secrets) out[secret.name] = secret.value
-  await writeSecretsFile(env.functionsDir, out)
+  await writeSecretsFile(dir, out)
 }
 
-app.use('/platform/projects/:ref/secrets', async (c, next) => {
-  if (!env.functionsDir) {
-    return c.json({ message: 'edge functions management is not configured (FUNCTIONS_DIR)' }, 501)
-  }
-  await next()
-})
-
 app.get('/platform/projects/:ref/secrets', async (c) => {
-  const secrets = await getFunctionSecrets()
+  const ref = c.req.param('ref')
+  const resolved = await resolveFunctionsDir(ref)
+  if ('status' in resolved) return c.json({ message: resolved.message }, resolved.status)
+  const secrets = await getFunctionSecrets(ref)
   // Secret values are write-only through the API: the list response exposes
   // a SHA256 digest of each value, matching the hosted platform contract.
   return c.json(
@@ -460,6 +508,9 @@ const RESERVED_SECRET_NAMES = new Set([
 ])
 
 app.post('/platform/projects/:ref/secrets', async (c) => {
+  const ref = c.req.param('ref')
+  const resolved = await resolveFunctionsDir(ref)
+  if ('status' in resolved) return c.json({ message: resolved.message }, resolved.status)
   const payload = await c.req.json<Array<{ name?: string; value?: string }>>()
   if (!Array.isArray(payload)) {
     return c.json({ message: 'body must be an array of { name, value }' }, 400)
@@ -479,18 +530,21 @@ app.post('/platform/projects/:ref/secrets', async (c) => {
     }
     secrets.push({ name: entry.name, value: entry.value })
   }
-  await upsertFunctionSecrets(secrets)
-  await syncSecretsFile()
+  await upsertFunctionSecrets(ref, secrets)
+  await syncSecretsFile(ref, resolved.dir)
   return c.json({}, 201)
 })
 
 app.delete('/platform/projects/:ref/secrets', async (c) => {
+  const ref = c.req.param('ref')
+  const resolved = await resolveFunctionsDir(ref)
+  if ('status' in resolved) return c.json({ message: resolved.message }, resolved.status)
   const payload = await c.req.json<string[]>()
   if (!Array.isArray(payload) || payload.some((name) => typeof name !== 'string')) {
     return c.json({ message: 'body must be an array of secret names' }, 400)
   }
-  await deleteFunctionSecrets(payload)
-  await syncSecretsFile()
+  await deleteFunctionSecrets(ref, payload)
+  await syncSecretsFile(ref, resolved.dir)
   return c.json({})
 })
 
@@ -1059,7 +1113,7 @@ async function main() {
   // PostgREST reads its trusted key set from a file this service owns, so it
   // has to exist (with the stack's own keys) before PostgREST starts.
   await syncThirdPartyJwks()
-  if (env.functionsDir) await syncFunctionManifest()
+  if (env.functionsDir) await syncFunctionManifest('default', env.functionsDir)
   serve({ fetch: app.fetch, port: env.port }, (info) => {
     console.log(`management-api listening on :${info.port}`)
   })
