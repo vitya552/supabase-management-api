@@ -12,6 +12,8 @@ export type DashboardUser = {
   id: number
   username: string
   role: DashboardRole
+  first_name: string
+  last_name: string
   inserted_at: Date
 }
 
@@ -41,6 +43,10 @@ export async function migrateDashboardUsers(): Promise<void> {
     );
     alter table management.dashboard_invitations
       add column if not exists invited_email text not null default '';
+    alter table management.dashboard_users
+      add column if not exists first_name text not null default '';
+    alter table management.dashboard_users
+      add column if not exists last_name text not null default '';
     create table if not exists management.dashboard_user_factors (
       id serial primary key,
       username text not null,
@@ -68,7 +74,7 @@ async function verifyPassword(password: string, stored: string): Promise<boolean
 
 export async function getDashboardUser(username: string): Promise<DashboardUser | null> {
   const { rows } = await pool.query(
-    'select id, username, role, inserted_at from management.dashboard_users where username = $1',
+    'select id, username, role, first_name, last_name, inserted_at from management.dashboard_users where username = $1',
     [username]
   )
   return rows[0] ?? null
@@ -76,9 +82,20 @@ export async function getDashboardUser(username: string): Promise<DashboardUser 
 
 export async function listDashboardUsers(): Promise<DashboardUser[]> {
   const { rows } = await pool.query(
-    'select id, username, role, inserted_at from management.dashboard_users order by id'
+    'select id, username, role, first_name, last_name, inserted_at from management.dashboard_users order by id'
   )
   return rows
+}
+
+export async function updateDashboardUserProfile(
+  username: string,
+  profile: { firstName: string; lastName: string }
+): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    'update management.dashboard_users set first_name = $2, last_name = $3 where username = $1',
+    [username, profile.firstName, profile.lastName]
+  )
+  return (rowCount ?? 0) > 0
 }
 
 export async function createDashboardUser(input: {
@@ -90,7 +107,7 @@ export async function createDashboardUser(input: {
   const { rows } = await pool.query(
     `insert into management.dashboard_users (username, password_hash, role)
      values ($1, $2, $3)
-     returning id, username, role, inserted_at`,
+     returning id, username, role, first_name, last_name, inserted_at`,
     [input.username, passwordHash, input.role]
   )
   return rows[0]
@@ -248,7 +265,7 @@ export async function acceptInvitation(input: {
       const inserted = await client.query(
         `insert into management.dashboard_users (username, password_hash, role)
          values ($1, $2, $3)
-         returning id, username, role, inserted_at`,
+         returning id, username, role, first_name, last_name, inserted_at`,
         [input.username, passwordHash, invitation.role]
       )
       await client.query('commit')
@@ -333,6 +350,14 @@ export async function listVerifiedFactorSecrets(username: string): Promise<strin
   return rows.map((row: { secret: string }) => decryptString(row.secret, MFA_SECRET_CONTEXT))
 }
 
+/** Usernames that have at least one verified TOTP factor. */
+export async function listUsernamesWithVerifiedFactors(): Promise<Set<string>> {
+  const { rows } = await pool.query(
+    `select distinct username from management.dashboard_user_factors where status = 'verified'`
+  )
+  return new Set(rows.map((row: { username: string }) => row.username))
+}
+
 export async function hasVerifiedFactor(username: string): Promise<boolean> {
   const { rows } = await pool.query(
     `select 1 from management.dashboard_user_factors where username = $1 and status = 'verified' limit 1`,
@@ -347,12 +372,19 @@ export async function verifyDashboardUser(
   password: string
 ): Promise<DashboardUser | null> {
   const { rows } = await pool.query(
-    'select id, username, password_hash, role, inserted_at from management.dashboard_users where username = $1',
+    'select id, username, password_hash, role, first_name, last_name, inserted_at from management.dashboard_users where username = $1',
     [username]
   )
   const row = rows[0]
   if (!row) return null
   const isValid = await verifyPassword(password, row.password_hash)
   if (!isValid) return null
-  return { id: row.id, username: row.username, role: row.role, inserted_at: row.inserted_at }
+  return {
+    id: row.id,
+    username: row.username,
+    role: row.role,
+    first_name: row.first_name,
+    last_name: row.last_name,
+    inserted_at: row.inserted_at,
+  }
 }
