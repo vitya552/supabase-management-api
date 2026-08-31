@@ -40,6 +40,30 @@ export async function isSmtpConfigured(): Promise<boolean> {
   return (await getSmtpSettings()) !== null
 }
 
+const SMTP_FALLBACK_KEYS = [
+  'SMTP_HOST',
+  'SMTP_PORT',
+  'SMTP_USER',
+  'SMTP_PASS',
+  'SMTP_ADMIN_EMAIL',
+  'SMTP_SENDER_NAME',
+] as const
+
+/**
+ * The default project's effective SMTP settings, inherited by projects
+ * that have no SMTP configuration of their own.
+ */
+export async function defaultSmtpFallback(): Promise<Record<string, ConfigValue>> {
+  const config = { ...baselineConfig(), ...(await getAllConfig('default')) }
+  if (!asString(config.SMTP_HOST) || !asString(config.SMTP_ADMIN_EMAIL)) return {}
+  const out: Record<string, ConfigValue> = {}
+  for (const key of SMTP_FALLBACK_KEYS) {
+    const value = config[key]
+    if (value !== undefined && value !== null) out[key] = value
+  }
+  return out
+}
+
 /** Sends a dashboard invitation email. Returns false when SMTP is not
  * configured; throws when SMTP is configured but delivery fails. */
 export async function sendInvitationEmail(input: {

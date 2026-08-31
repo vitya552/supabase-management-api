@@ -3,6 +3,7 @@ import { dirname, join } from 'node:path'
 
 import { AUTH_CONFIG_KEYS } from './auth-config-keys.js'
 import { env } from './env.js'
+import { defaultSmtpFallback } from './mailer.js'
 import { type ConfigValue, getAllConfig, getAllEmailTemplates } from './store.js'
 
 export const MANAGED_ENV_FILE = '90-managed.env'
@@ -140,6 +141,11 @@ export async function syncEnvFile(projectRef: string = 'default'): Promise<void>
     getAllConfig(projectRef),
     getAllEmailTemplates(projectRef),
   ])
+  // Projects without their own SMTP configuration inherit the default
+  // project's SMTP so auth emails work out of the box.
+  if (projectRef !== 'default' && typeof config.SMTP_HOST !== 'string') {
+    Object.assign(config, { ...(await defaultSmtpFallback()), ...config })
+  }
   const content = renderEnvFile(
     config,
     templates.map((t) => t.template_type),
