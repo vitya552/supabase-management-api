@@ -1,6 +1,7 @@
 import { createHash, randomBytes, scrypt, timingSafeEqual } from 'node:crypto'
 import { promisify } from 'node:util'
 
+import { decryptString, encryptString } from './crypto.js'
 import { pool } from './store.js'
 
 const scryptAsync = promisify(scrypt)
@@ -40,6 +41,14 @@ export async function migrateDashboardUsers(): Promise<void> {
     );
     alter table management.dashboard_invitations
       add column if not exists invited_email text not null default '';
+    create table if not exists management.dashboard_user_factors (
+      id serial primary key,
+      username text not null,
+      friendly_name text not null default '',
+      secret text not null,
+      status text not null default 'unverified' check (status in ('unverified', 'verified')),
+      inserted_at timestamptz not null default now()
+    );
   `)
 }
 
@@ -251,6 +260,85 @@ export async function acceptInvitation(input: {
   } finally {
     client.release()
   }
+}
+
+export type DashboardUserFactor = {
+  id: number
+  username: string
+  friendly_name: string
+  status: 'unverified' | 'verified'
+  inserted_at: Date
+}
+
+const MFA_SECRET_CONTEXT = 'dashboard-mfa'
+
+/** TOTP factors for a user; secrets stay encrypted and are never returned. */
+export async function listUserFactors(username: string): Promise<DashboardUserFactor[]> {
+  const { rows } = await pool.query(
+    `select id, username, friendly_name, status, inserted_at
+     from management.dashboard_user_factors where username = $1 order by id`,
+    [username]
+  )
+  return rows
+}
+
+export async function createUserFactor(input: {
+  username: string
+  friendlyName: string
+  secret: string
+}): Promise<DashboardUserFactor> {
+  const { rows } = await pool.query(
+    `insert into management.dashboard_user_factors (username, friendly_name, secret)
+     values ($1, $2, $3)
+     returning id, username, friendly_name, status, inserted_at`,
+    [input.username, input.friendlyName, encryptString(input.secret, MFA_SECRET_CONTEXT)]
+  )
+  return rows[0]
+}
+
+/** Decrypted secret of one of the user's factors, optionally by status. */
+export async function getUserFactorSecret(
+  username: string,
+  factorId: number
+): Promise<{ secret: string; status: 'unverified' | 'verified' } | null> {
+  const { rows } = await pool.query(
+    'select secret, status from management.dashboard_user_factors where username = $1 and id = $2',
+    [username, factorId]
+  )
+  const row = rows[0]
+  if (!row) return null
+  return { secret: decryptString(row.secret, MFA_SECRET_CONTEXT), status: row.status }
+}
+
+export async function markFactorVerified(username: string, factorId: number): Promise<void> {
+  await pool.query(
+    `update management.dashboard_user_factors set status = 'verified' where username = $1 and id = $2`,
+    [username, factorId]
+  )
+}
+
+export async function deleteUserFactor(username: string, factorId: number): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    'delete from management.dashboard_user_factors where username = $1 and id = $2',
+    [username, factorId]
+  )
+  return (rowCount ?? 0) > 0
+}
+
+export async function listVerifiedFactorSecrets(username: string): Promise<string[]> {
+  const { rows } = await pool.query(
+    `select secret from management.dashboard_user_factors where username = $1 and status = 'verified'`,
+    [username]
+  )
+  return rows.map((row: { secret: string }) => decryptString(row.secret, MFA_SECRET_CONTEXT))
+}
+
+export async function hasVerifiedFactor(username: string): Promise<boolean> {
+  const { rows } = await pool.query(
+    `select 1 from management.dashboard_user_factors where username = $1 and status = 'verified' limit 1`,
+    [username]
+  )
+  return rows.length > 0
 }
 
 /** Checks a login against the dashboard users stored in the database. */

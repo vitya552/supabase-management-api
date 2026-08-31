@@ -75,6 +75,58 @@ export function isValidSessionToken(token: string, now = Date.now()): boolean {
   return getSessionIdentity(token, now) !== null
 }
 
+const MFA_TOKEN_TTL_SECONDS = 5 * 60
+
+/**
+ * Short-lived token issued after a correct password when the account still
+ * needs a TOTP code. It is not a session: only the MFA verification endpoint
+ * accepts it.
+ */
+export function createMfaPendingToken(
+  identity: DashboardSessionIdentity,
+  now = Date.now()
+): string {
+  const payload = Buffer.from(
+    JSON.stringify({
+      typ: 'mfa',
+      exp: Math.floor(now / 1000) + MFA_TOKEN_TTL_SECONDS,
+      sub: identity.username,
+      role: identity.role,
+    })
+  ).toString('base64url')
+  return `mfa.${payload}.${hmac(payload)}`
+}
+
+export function getMfaPendingIdentity(
+  token: string,
+  now = Date.now()
+): DashboardSessionIdentity | null {
+  if (!token.startsWith('mfa.')) return null
+  const rest = token.slice(4)
+  const dot = rest.indexOf('.')
+  if (dot === -1) return null
+  const payload = rest.slice(0, dot)
+  const signature = rest.slice(dot + 1)
+  if (!safeEqual(signature, hmac(payload))) return null
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as {
+      typ?: unknown
+      exp?: unknown
+      sub?: unknown
+      role?: unknown
+    }
+    if (parsed.typ !== 'mfa') return null
+    if (typeof parsed.exp !== 'number' || parsed.exp * 1000 < now) return null
+    if (typeof parsed.sub !== 'string') return null
+    if (parsed.role !== 'owner' && parsed.role !== 'admin' && parsed.role !== 'developer') {
+      return null
+    }
+    return { username: parsed.sub, role: parsed.role }
+  } catch {
+    return null
+  }
+}
+
 /** `Set-Cookie` value for a fresh session, or for clearing it. */
 export function sessionCookie(token: string | null): string {
   // `Secure` would make the cookie unusable on the plain-HTTP deployments the

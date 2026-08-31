@@ -9,9 +9,11 @@ import pg from 'pg'
 import { AUTH_CONFIG_KEYS } from './auth-config-keys.js'
 import { baselineConfig } from './baseline.js'
 import {
+  createMfaPendingToken,
   createSessionToken,
   type DashboardSessionIdentity,
   getCookie,
+  getMfaPendingIdentity,
   getSessionIdentity,
   isLoginRateLimited,
   isValidBasicAuthHeader,
@@ -26,19 +28,27 @@ import {
   acceptInvitation,
   createDashboardUser,
   createInvitation,
+  createUserFactor,
   DASHBOARD_ROLES,
   type DashboardRole,
   deleteDashboardUser,
   deleteInvitation,
+  deleteUserFactor,
   getDashboardUser,
+  getUserFactorSecret,
+  hasVerifiedFactor,
   listDashboardUsers,
   listInvitations,
+  listUserFactors,
+  listVerifiedFactorSecrets,
+  markFactorVerified,
   migrateDashboardUsers,
   updateDashboardUserPassword,
   updateDashboardUserRole,
   verifyDashboardUser,
 } from './dashboard-users.js'
 import { renderReactEmail } from './emails.js'
+import { generateTotpSecret, totpUri, verifyTotpCode } from './totp.js'
 import { defaultAuthConfig } from './gotrue-defaults.js'
 import { defaultReactEmailSource } from './react-email-defaults.js'
 import { env } from './env.js'
@@ -766,6 +776,36 @@ app.post('/dashboard-auth/login', async (c) => {
   }
 
   resetLoginRateLimit(clientKey)
+  // Accounts with a verified TOTP factor get a short-lived pending token
+  // instead of a session; the session is only issued after a correct code.
+  if (await hasVerifiedFactor(identity.username)) {
+    return c.json({ mfa_required: true, mfa_token: createMfaPendingToken(identity) })
+  }
+  c.header('Set-Cookie', sessionCookie(createSessionToken(identity)))
+  return c.json({ message: 'ok' })
+})
+
+// Second login step for accounts with TOTP enabled.
+app.post('/dashboard-auth/mfa-verify', async (c) => {
+  const forwardedFor = c.req.header('x-forwarded-for')?.split(',') ?? []
+  const clientKey =
+    c.req.header('x-envoy-external-address') || forwardedFor.at(-1)?.trim() || 'unknown'
+  if (isLoginRateLimited(clientKey)) {
+    return c.json({ message: 'Too many attempts, try again later' }, 429)
+  }
+
+  const payload = await c.req.json<{ mfa_token?: string; code?: string }>().catch(() => null)
+  const identity = getMfaPendingIdentity(payload?.mfa_token ?? '')
+  if (identity === null) {
+    return c.json({ message: 'sign in again to continue' }, 401)
+  }
+  const code = typeof payload?.code === 'string' ? payload.code.trim() : ''
+  const secrets = await listVerifiedFactorSecrets(identity.username)
+  if (!secrets.some((secret) => verifyTotpCode(secret, code))) {
+    return c.json({ message: 'Invalid verification code' }, 401)
+  }
+
+  resetLoginRateLimit(clientKey)
   c.header('Set-Cookie', sessionCookie(createSessionToken(identity)))
   return c.json({ message: 'ok' })
 })
@@ -1195,6 +1235,81 @@ app.post('/platform/profile/password', async (c) => {
   if (result === 'wrong_password') {
     return c.json({ message: 'current password is incorrect' }, 400)
   }
+  return c.json({})
+})
+
+// -- Dashboard MFA (TOTP factors of the signed-in user) --------------------
+
+/** Cookie-authenticated user for the profile MFA endpoints. */
+async function factorOwner(c: {
+  req: { header: (name: string) => string | undefined }
+}): Promise<DashboardSessionIdentity | null> {
+  const identity = await requestIdentity(c)
+  if (identity === 'invalid' || identity === null) return null
+  return identity
+}
+
+app.get('/platform/profile/factors', async (c) => {
+  const identity = await factorOwner(c)
+  if (!identity) return c.json({ message: 'sign in to manage MFA factors' }, 401)
+  const factors = await listUserFactors(identity.username)
+  return c.json(
+    factors.map((f) => ({
+      id: f.id,
+      friendly_name: f.friendly_name,
+      status: f.status,
+      inserted_at: new Date(f.inserted_at).toISOString(),
+    }))
+  )
+})
+
+app.post('/platform/profile/factors', async (c) => {
+  const identity = await factorOwner(c)
+  if (!identity) return c.json({ message: 'sign in to manage MFA factors' }, 401)
+  const payload = await c.req.json<{ friendly_name?: string }>().catch(() => null)
+  const friendlyName =
+    typeof payload?.friendly_name === 'string' ? payload.friendly_name.slice(0, 64) : ''
+  const secret = generateTotpSecret()
+  const factor = await createUserFactor({
+    username: identity.username,
+    friendlyName,
+    secret,
+  })
+  // The secret is only returned once, at enrollment.
+  return c.json(
+    {
+      id: factor.id,
+      friendly_name: factor.friendly_name,
+      status: factor.status,
+      totp: { secret, uri: totpUri(secret, identity.username, 'Supabase Studio') },
+    },
+    201
+  )
+})
+
+app.post('/platform/profile/factors/:id/verify', async (c) => {
+  const identity = await factorOwner(c)
+  if (!identity) return c.json({ message: 'sign in to manage MFA factors' }, 401)
+  const factorId = Number(c.req.param('id'))
+  if (!Number.isInteger(factorId)) return c.json({ message: 'invalid factor id' }, 400)
+  const payload = await c.req.json<{ code?: string }>().catch(() => null)
+  const code = typeof payload?.code === 'string' ? payload.code.trim() : ''
+  const factor = await getUserFactorSecret(identity.username, factorId)
+  if (!factor) return c.json({ message: 'factor not found' }, 404)
+  if (!verifyTotpCode(factor.secret, code)) {
+    return c.json({ message: 'invalid verification code' }, 400)
+  }
+  await markFactorVerified(identity.username, factorId)
+  return c.json({ id: factorId, status: 'verified' })
+})
+
+app.delete('/platform/profile/factors/:id', async (c) => {
+  const identity = await factorOwner(c)
+  if (!identity) return c.json({ message: 'sign in to manage MFA factors' }, 401)
+  const factorId = Number(c.req.param('id'))
+  if (!Number.isInteger(factorId)) return c.json({ message: 'invalid factor id' }, 400)
+  const deleted = await deleteUserFactor(identity.username, factorId)
+  if (!deleted) return c.json({ message: 'factor not found' }, 404)
   return c.json({})
 })
 
