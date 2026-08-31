@@ -34,6 +34,7 @@ import {
   deleteDashboardUser,
   deleteInvitation,
   deleteUserFactor,
+  getDashboardProfile,
   getDashboardUser,
   getUserFactorSecret,
   hasVerifiedFactor,
@@ -65,7 +66,7 @@ import {
   writeManifestFile,
   writeSecretsFile,
 } from './functions.js'
-import { defaultSmtpFallback, isSmtpConfigured, sendInvitationEmail } from './mailer.js'
+import { isSmtpConfigured, sendInvitationEmail, withSmtpFallback } from './mailer.js'
 import { handleProjectUpgrade, proxyProjectRequest } from './project-proxy.js'
 import { getRealtimeConfig, updateRealtimeConfig } from './realtime-config.js'
 import { getS3ProtocolInfo, getStorageConfig } from './storage-config.js'
@@ -298,20 +299,22 @@ function composeProjectBaseline(ref: string): Record<string, ConfigValue> {
 
 async function currentConfig(ref: string) {
   const stored = await getAllConfig(ref)
-  // Projects without their own SMTP inherit the default project's SMTP
-  // (mirrors the env file materialization in envfile.ts).
-  const smtpFallback =
-    ref !== 'default' && typeof stored.SMTP_HOST !== 'string' ? await defaultSmtpFallback() : {}
   const templatesCustom: Record<string, boolean> = {}
   const subjectsCustom: Record<string, boolean> = {}
   for (const key of Object.keys(stored)) {
     if (/^MAILER_TEMPLATES_.+_CONTENT$/.test(key)) templatesCustom[key] = true
     else if (key.startsWith('MAILER_SUBJECTS_')) subjectsCustom[key] = true
   }
+  let merged = {
+    ...(ref === 'default' ? baselineConfig() : composeProjectBaseline(ref)),
+    ...stored,
+  }
+  // Projects without their own SMTP inherit the default project's SMTP
+  // (mirrors the env file materialization in envfile.ts).
+  if (ref !== 'default') merged = await withSmtpFallback(merged)
   return {
     ...defaultAuthConfig(),
-    ...(ref === 'default' ? baselineConfig() : { ...composeProjectBaseline(ref), ...smtpFallback }),
-    ...stored,
+    ...merged,
     MAILER_TEMPLATES_CUSTOM_CONTENTS: templatesCustom,
     MAILER_SUBJECTS_CUSTOM_CONTENTS: subjectsCustom,
   }
@@ -1241,11 +1244,11 @@ app.get('/platform/profile', async (c) => {
     return c.json({ message: 'session is no longer valid' }, 401)
   }
   if (!identity) return c.json({ username: 'service', role: 'owner' })
-  const user = await getDashboardUser(identity.username)
+  const profile = await getDashboardProfile(identity.username)
   return c.json({
     ...identity,
-    first_name: user?.first_name ?? '',
-    last_name: user?.last_name ?? '',
+    first_name: profile.first_name,
+    last_name: profile.last_name,
   })
 })
 
@@ -1280,11 +1283,7 @@ app.patch('/platform/profile', async (c) => {
   if (payload === null) return c.json({ message: 'invalid payload' }, 400)
   const firstName = typeof payload.first_name === 'string' ? payload.first_name.trim() : ''
   const lastName = typeof payload.last_name === 'string' ? payload.last_name.trim() : ''
-  const updated = await updateDashboardUserProfile(identity.username, { firstName, lastName })
-  if (!updated) {
-    // The break-glass .env login has no database row to store profile details on.
-    return c.json({ message: 'this account is managed via environment variables' }, 400)
-  }
+  await updateDashboardUserProfile(identity.username, { firstName, lastName })
   return c.json({
     ...identity,
     first_name: firstName,

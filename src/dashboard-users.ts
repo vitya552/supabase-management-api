@@ -47,6 +47,11 @@ export async function migrateDashboardUsers(): Promise<void> {
       add column if not exists first_name text not null default '';
     alter table management.dashboard_users
       add column if not exists last_name text not null default '';
+    create table if not exists management.dashboard_profiles (
+      username text primary key,
+      first_name text not null default '',
+      last_name text not null default ''
+    );
     create table if not exists management.dashboard_user_factors (
       id serial primary key,
       username text not null,
@@ -95,7 +100,30 @@ export async function updateDashboardUserProfile(
     'update management.dashboard_users set first_name = $2, last_name = $3 where username = $1',
     [username, profile.firstName, profile.lastName]
   )
-  return (rowCount ?? 0) > 0
+  if ((rowCount ?? 0) > 0) return true
+  // Environment-managed accounts (the break-glass login) have no
+  // dashboard_users row; their profile lives in dashboard_profiles.
+  await pool.query(
+    `insert into management.dashboard_profiles (username, first_name, last_name)
+     values ($1, $2, $3)
+     on conflict (username) do update set first_name = $2, last_name = $3`,
+    [username, profile.firstName, profile.lastName]
+  )
+  return true
+}
+
+/** Profile names for a user, whether DB-backed or environment-managed. */
+export async function getDashboardProfile(
+  username: string
+): Promise<{ first_name: string; last_name: string }> {
+  const { rows } = await pool.query(
+    `select first_name, last_name from management.dashboard_users where username = $1
+     union all
+     select first_name, last_name from management.dashboard_profiles where username = $1
+     limit 1`,
+    [username]
+  )
+  return rows[0] ?? { first_name: '', last_name: '' }
 }
 
 export async function createDashboardUser(input: {
