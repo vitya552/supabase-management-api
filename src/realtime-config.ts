@@ -83,6 +83,8 @@ export async function updateRealtimeConfig(
   const target = await resolveTarget(ref)
   if (target === null) return null
   const tenant = pickTenantFields(updates)
+  // Suspending is not supported: the seeded self-host tenant ignores it.
+  delete tenant.suspend
   const response = await fetch(`${target.baseUrl}/api/tenants/${TENANT_ID}`, {
     method: 'PATCH',
     headers: {
