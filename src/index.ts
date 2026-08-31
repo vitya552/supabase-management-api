@@ -40,13 +40,16 @@ import {
   listDashboardUsers,
   listInvitations,
   listUserFactors,
+  listUsernamesWithVerifiedFactors,
   listVerifiedFactorSecrets,
   markFactorVerified,
   migrateDashboardUsers,
   updateDashboardUserPassword,
+  updateDashboardUserProfile,
   updateDashboardUserRole,
   verifyDashboardUser,
 } from './dashboard-users.js'
+import { listAuditLogs, migrateAuditLogs, recordAuditLog } from './audit-log.js'
 import { renderReactEmail } from './emails.js'
 import { generateTotpSecret, totpUri, verifyTotpCode } from './totp.js'
 import { defaultAuthConfig } from './gotrue-defaults.js'
@@ -62,7 +65,7 @@ import {
   writeManifestFile,
   writeSecretsFile,
 } from './functions.js'
-import { isSmtpConfigured, sendInvitationEmail } from './mailer.js'
+import { defaultSmtpFallback, isSmtpConfigured, sendInvitationEmail } from './mailer.js'
 import { handleProjectUpgrade, proxyProjectRequest } from './project-proxy.js'
 import { getRealtimeConfig, updateRealtimeConfig } from './realtime-config.js'
 import { getS3ProtocolInfo, getStorageConfig } from './storage-config.js'
@@ -149,6 +152,24 @@ app.use('/platform/*', async (c, next) => {
     return c.json({ message: 'Unauthorized' }, 401)
   }
   await next()
+})
+
+// Records every mutating request for the account audit log page.
+app.use('/platform/*', async (c, next) => {
+  await next()
+  const method = c.req.method
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return
+  const identity = await requestIdentity(c).catch(() => null)
+  const username = identity && identity !== 'invalid' ? identity.username : 'service'
+  const route = c.req.path
+  const refMatch = route.match(/^\/platform\/projects\/([^/]+)/)
+  await recordAuditLog({
+    username,
+    method,
+    route,
+    status: c.res.status,
+    projectRef: refMatch ? refMatch[1] : null,
+  }).catch((err) => console.error('failed to record audit log:', err))
 })
 
 /**
@@ -277,6 +298,10 @@ function composeProjectBaseline(ref: string): Record<string, ConfigValue> {
 
 async function currentConfig(ref: string) {
   const stored = await getAllConfig(ref)
+  // Projects without their own SMTP inherit the default project's SMTP
+  // (mirrors the env file materialization in envfile.ts).
+  const smtpFallback =
+    ref !== 'default' && typeof stored.SMTP_HOST !== 'string' ? await defaultSmtpFallback() : {}
   const templatesCustom: Record<string, boolean> = {}
   const subjectsCustom: Record<string, boolean> = {}
   for (const key of Object.keys(stored)) {
@@ -285,7 +310,7 @@ async function currentConfig(ref: string) {
   }
   return {
     ...defaultAuthConfig(),
-    ...(ref === 'default' ? baselineConfig() : composeProjectBaseline(ref)),
+    ...(ref === 'default' ? baselineConfig() : { ...composeProjectBaseline(ref), ...smtpFallback }),
     ...stored,
     MAILER_TEMPLATES_CUSTOM_CONTENTS: templatesCustom,
     MAILER_SUBJECTS_CUSTOM_CONTENTS: subjectsCustom,
@@ -1184,15 +1209,28 @@ app.patch('/platform/projects/:ref/config/realtime', async (c) => {
 
 app.get('/platform/dashboard-users', async (c) => {
   const users = await listDashboardUsers()
+  const mfaUsernames = await listUsernamesWithVerifiedFactors()
+  const withMfa = users.map((user) => ({
+    ...user,
+    mfa_enabled: mfaUsernames.has(user.username),
+  }))
   // The break-glass `.env` login is not a dashboard_users row; surface it as a
   // virtual owner so member lists are complete for every viewer.
-  if (env.dashboardUsername && !users.some((u) => u.username === env.dashboardUsername)) {
+  if (env.dashboardUsername && !withMfa.some((u) => u.username === env.dashboardUsername)) {
     return c.json([
-      { id: 0, username: env.dashboardUsername, role: 'owner', inserted_at: '' },
-      ...users,
+      {
+        id: 0,
+        username: env.dashboardUsername,
+        role: 'owner',
+        first_name: '',
+        last_name: '',
+        mfa_enabled: false,
+        inserted_at: '',
+      },
+      ...withMfa,
     ])
   }
-  return c.json(users)
+  return c.json(withMfa)
 })
 
 // The caller's own identity/role, for role-aware UI.
@@ -1202,7 +1240,56 @@ app.get('/platform/profile', async (c) => {
     c.header('Set-Cookie', sessionCookie(null))
     return c.json({ message: 'session is no longer valid' }, 401)
   }
-  return c.json(identity ?? { username: 'service', role: 'owner' })
+  if (!identity) return c.json({ username: 'service', role: 'owner' })
+  const user = await getDashboardUser(identity.username)
+  return c.json({
+    ...identity,
+    first_name: user?.first_name ?? '',
+    last_name: user?.last_name ?? '',
+  })
+})
+
+// Audit trail of mutating management API requests, for the account page.
+app.get('/platform/profile/audit', async (c) => {
+  const identity = await requestIdentity(c)
+  if (identity === 'invalid') {
+    c.header('Set-Cookie', sessionCookie(null))
+    return c.json({ message: 'session is no longer valid' }, 401)
+  }
+  const start = new Date(c.req.query('iso_timestamp_start') ?? '')
+  const end = new Date(c.req.query('iso_timestamp_end') ?? '')
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    return c.json({ message: 'iso_timestamp_start and iso_timestamp_end are required' }, 400)
+  }
+  const logs = await listAuditLogs({ start, end })
+  return c.json({ result: logs, retention_period: 0 })
+})
+
+// Lets the signed-in dashboard user update their own profile details.
+app.patch('/platform/profile', async (c) => {
+  const identity = await requestIdentity(c)
+  if (identity === 'invalid') {
+    c.header('Set-Cookie', sessionCookie(null))
+    return c.json({ message: 'session is no longer valid' }, 401)
+  }
+  if (!identity) return c.json({ message: 'sign in to update your profile' }, 401)
+  const payload = await c
+    .req
+    .json<{ first_name?: string; last_name?: string }>()
+    .catch(() => null)
+  if (payload === null) return c.json({ message: 'invalid payload' }, 400)
+  const firstName = typeof payload.first_name === 'string' ? payload.first_name.trim() : ''
+  const lastName = typeof payload.last_name === 'string' ? payload.last_name.trim() : ''
+  const updated = await updateDashboardUserProfile(identity.username, { firstName, lastName })
+  if (!updated) {
+    // The break-glass .env login has no database row to store profile details on.
+    return c.json({ message: 'this account is managed via environment variables' }, 400)
+  }
+  return c.json({
+    ...identity,
+    first_name: firstName,
+    last_name: lastName,
+  })
 })
 
 // Lets the signed-in dashboard user rotate their own password.
@@ -1555,6 +1642,7 @@ async function main() {
   await migrateThirdPartyAuth()
   await migrateProjects()
   await migrateDashboardUsers()
+  await migrateAuditLogs()
   await syncEnvFile()
   // PostgREST reads its trusted key set from a file this service owns, so it
   // has to exist (with the stack's own keys) before PostgREST starts.
