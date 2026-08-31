@@ -3,8 +3,6 @@ import { Hono } from 'hono'
 import { logger } from 'hono/logger'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
-import path from 'node:path'
-import pg from 'pg'
 
 import { AUTH_CONFIG_KEYS } from './auth-config-keys.js'
 import { baselineConfig } from './baseline.js'
@@ -70,7 +68,6 @@ import { isSmtpConfigured, sendInvitationEmail } from './mailer.js'
 import { getRealtimeConfig, updateRealtimeConfig } from './realtime-config.js'
 import { getS3ProtocolInfo, getStorageConfig } from './storage-config.js'
 import {
-  createOrganization,
   getProject,
   listOrganizations,
   updateOrganization,
@@ -262,6 +259,19 @@ async function applyConfigPatch(ref: string, payload: Record<string, unknown>) {
   return { errors: [] as string[] }
 }
 
+/** Config keys whose values are credentials and must not reach non-admins. */
+const SENSITIVE_CONFIG_KEY_RE = /SECRET|_PASS$|API_KEY|ACCESS_KEY|AUTH_TOKEN|PRIVATE_KEY/
+
+function redactSensitiveConfig<T extends Record<string, unknown>>(config: T): T {
+  const redacted: Record<string, unknown> = { ...config }
+  for (const key of Object.keys(redacted)) {
+    if (SENSITIVE_CONFIG_KEY_RE.test(key) && typeof redacted[key] === 'string' && redacted[key]) {
+      redacted[key] = ''
+    }
+  }
+  return redacted as T
+}
+
 async function currentConfig(ref: string) {
   const stored = await getAllConfig(ref)
   const templatesCustom: Record<string, boolean> = {}
@@ -285,10 +295,16 @@ async function currentConfig(ref: string) {
 app.get('/platform/auth/:ref/config', async (c) => {
   const ref = await resolveAuthRef(c.req.param('ref'))
   if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
-  return c.json(await currentConfig(ref))
+  const config = await currentConfig(ref)
+  // Provider/SMTP/hook credentials are only shown to owners and admins;
+  // developers get the config shape with the secret values blanked.
+  return c.json((await canAdminister(c)) ? config : redactSensitiveConfig(config))
 })
 
 app.patch('/platform/auth/:ref/config', async (c) => {
+  if (!(await canAdminister(c))) {
+    return c.json({ message: 'only owners and admins can update auth settings' }, 403)
+  }
   const ref = await resolveAuthRef(c.req.param('ref'))
   if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
   const payload = await c.req.json<Record<string, unknown>>()
@@ -298,6 +314,9 @@ app.patch('/platform/auth/:ref/config', async (c) => {
 })
 
 app.patch('/platform/auth/:ref/config/hooks', async (c) => {
+  if (!(await canAdminister(c))) {
+    return c.json({ message: 'only owners and admins can update auth settings' }, 403)
+  }
   const ref = await resolveAuthRef(c.req.param('ref'))
   if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
   const payload = await c.req.json<Record<string, unknown>>()
@@ -323,6 +342,9 @@ function templateParam(c: { req: { param: (name: string) => string } }): string 
 }
 
 app.post('/platform/auth/:ref/templates/:template/reset', async (c) => {
+  if (!(await canAdminister(c))) {
+    return c.json({ message: 'only owners and admins can update email templates' }, 403)
+  }
   const ref = await resolveAuthRef(c.req.param('ref'))
   if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
   const template = templateParam(c)
@@ -342,6 +364,9 @@ app.post('/platform/auth/:ref/templates/:template/reset', async (c) => {
  * HTML and wires it up as the GoTrue template for the given type.
  */
 app.put('/platform/auth/:ref/templates/:template/react', async (c) => {
+  if (!(await canAdminister(c))) {
+    return c.json({ message: 'only owners and admins can update email templates' }, 403)
+  }
   const ref = await resolveAuthRef(c.req.param('ref'))
   if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
   const template = templateParam(c)
@@ -659,6 +684,9 @@ app.get('/platform/projects/:ref/config/auth/third-party-auth', async (c) => {
 })
 
 app.post('/platform/projects/:ref/config/auth/third-party-auth', async (c) => {
+  if (!(await canAdminister(c))) {
+    return c.json({ message: 'only owners and admins can manage third-party auth' }, 403)
+  }
   const ref = await resolveAuthRef(c.req.param('ref'))
   if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
   const payload = await c.req.json<{
@@ -684,6 +712,9 @@ app.get('/platform/projects/:ref/config/auth/third-party-auth/:id', async (c) =>
 })
 
 app.delete('/platform/projects/:ref/config/auth/third-party-auth/:id', async (c) => {
+  if (!(await canAdminister(c))) {
+    return c.json({ message: 'only owners and admins can manage third-party auth' }, 403)
+  }
   const ref = await resolveAuthRef(c.req.param('ref'))
   if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
   const integration = await deleteIntegration(ref, c.req.param('id'))
@@ -899,11 +930,13 @@ app.patch('/platform/organizations/:slug', async (c) => {
 })
 
 app.post('/platform/organizations', async (c) => {
-  const payload = await c.req.json<{ name?: string }>().catch(() => null)
-  if (!payload?.name || typeof payload.name !== 'string') {
-    return c.json({ message: 'body must contain a `name` string' }, 400)
-  }
-  return c.json(await createOrganization(payload.name), 201)
+  return c.json(
+    {
+      message:
+        'self-hosted Supabase runs a single organization; creating organizations is not supported',
+    },
+    501
+  )
 })
 
 app.get('/platform/projects', async (c) => {
@@ -1337,6 +1370,9 @@ app.get('/platform/projects/:ref/config/postgrest', async (c) => {
 })
 
 app.patch('/platform/projects/:ref/config/postgrest', async (c) => {
+  if (!(await canAdminister(c))) {
+    return c.json({ message: 'only owners and admins can update PostgREST settings' }, 403)
+  }
   const payload = await c.req.json<{
     db_schema?: string
     max_rows?: number
@@ -1382,6 +1418,9 @@ app.get('/platform/projects/:ref/config/database/postgres', async (c) => {
 })
 
 app.put('/platform/projects/:ref/config/database/postgres', async (c) => {
+  if (!(await canAdminister(c))) {
+    return c.json({ message: 'only owners and admins can update Postgres settings' }, 403)
+  }
   const payload = await c.req.json<Record<string, unknown>>()
   const patch: Record<string, PostgresConfigValue> = {}
   for (const [name, value] of Object.entries(payload)) {
