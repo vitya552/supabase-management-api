@@ -1,7 +1,4 @@
-import pg from 'pg'
-
 import { env } from './env.js'
-import { getProject, projectDatabaseUrl } from './projects-store.js'
 import { pool } from './store.js'
 
 export type PostgrestConfig = {
@@ -18,47 +15,26 @@ const MANAGED_SETTINGS: Record<string, keyof PostgrestConfig> = {
   'pgrst.db_pool': 'db_pool',
 }
 
-/**
- * Compose project PostgREST containers are generated with these env
- * defaults (see provisioner.ts); the main stack's come from its own env.
- */
-function envDefaults(ref: string): Omit<PostgrestConfig, 'db_pool'> {
-  if (ref === 'default') {
-    return {
-      db_schema: env.pgrstDbSchemas,
-      max_rows: env.pgrstDbMaxRows,
-      db_extra_search_path: env.pgrstDbExtraSearchPath,
-    }
+function envDefaults(): Omit<PostgrestConfig, 'db_pool'> {
+  return {
+    db_schema: env.pgrstDbSchemas,
+    max_rows: env.pgrstDbMaxRows,
+    db_extra_search_path: env.pgrstDbExtraSearchPath,
   }
-  return { db_schema: 'public,graphql_public,storage', max_rows: 1000, db_extra_search_path: 'public' }
 }
 
 type QueryRunner = (sql: string) => Promise<{ rows: Record<string, unknown>[] }>
 
 /**
- * Runs queries against the project's own database, where its PostgREST
- * reads role config and reload notifications. Returns null when the
- * project has no PostgREST-backing database (unknown ref).
+ * Runs queries against the stack's database, where PostgREST reads role
+ * config and reload notifications. Returns null for unknown refs.
  */
 async function withProjectDb<T>(
   ref: string,
   fn: (query: QueryRunner) => Promise<T>
 ): Promise<T | null> {
-  if (ref === 'default') {
-    return fn((sql) => pool.query(sql))
-  }
-  // Only compose projects run their own PostgREST; external ones have none.
-  const project = await getProject(ref)
-  if (!project || project.kind !== 'compose') return null
-  const dbUrl = await projectDatabaseUrl(ref)
-  if (!dbUrl) return null
-  const client = new pg.Client({ connectionString: dbUrl })
-  await client.connect()
-  try {
-    return await fn((sql) => client.query(sql))
-  } finally {
-    await client.end().catch(() => undefined)
-  }
+  if (ref !== 'default') return null
+  return fn((sql) => pool.query(sql))
 }
 
 /**
@@ -67,7 +43,7 @@ async function withProjectDb<T>(
  * the container's environment defaults.
  */
 export async function getPostgrestConfig(ref: string): Promise<PostgrestConfig | null> {
-  const config: PostgrestConfig = { ...envDefaults(ref), db_pool: null }
+  const config: PostgrestConfig = { ...envDefaults(), db_pool: null }
 
   const result = await withProjectDb(ref, (query) =>
     query(

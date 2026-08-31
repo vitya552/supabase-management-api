@@ -1,7 +1,6 @@
 import pg from 'pg'
 
 import { env } from './env.js'
-import { projectDatabaseUrl } from './projects-store.js'
 import { pool } from './store.js'
 
 /**
@@ -69,10 +68,10 @@ export function validateGucValue(name: string, value: unknown): string | null {
   return null
 }
 
-/** The superuser connection string for a project's Postgres, or null. */
+/** The superuser connection string for the stack's Postgres, or null. */
 async function databaseUrlFor(ref: string): Promise<string | null> {
   if (ref === 'default') return env.databaseUrl
-  return projectDatabaseUrl(ref)
+  return null
 }
 
 export async function getPostgresConfig(

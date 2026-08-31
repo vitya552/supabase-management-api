@@ -1,11 +1,9 @@
 import { env } from './env.js'
-import { getProject } from './projects-store.js'
 
 /**
  * Storage configuration in the shape of the platform `StorageConfigResponse`.
  * Self-hosted storage reads its configuration from container environment
- * variables, so this is read-only: values are derived from the stack's env
- * (default project) or from the generated per-project compose files.
+ * variables, so this is read-only: values are derived from the stack's env.
  */
 export type StorageConfig = {
   fileSizeLimit: number
@@ -50,45 +48,22 @@ function buildConfig(input: {
   }
 }
 
-/** File size limit hardcoded in the generated per-project compose files. */
-const PROJECT_FILE_SIZE_LIMIT = 52428800
-
 export async function getStorageConfig(ref: string): Promise<StorageConfig | null> {
-  if (ref === 'default') {
-    return buildConfig({
-      fileSizeLimit: env.storageFileSizeLimit,
-      imageTransformation: true,
-      s3Protocol: Boolean(env.s3ProtocolAccessKeyId && env.s3ProtocolAccessKeySecret),
-      vectorBuckets: env.storageVectorsEnabled,
-    })
-  }
-  const project = await getProject(ref)
-  if (!project || project.kind !== 'compose') return null
+  if (ref !== 'default') return null
   return buildConfig({
-    fileSizeLimit: PROJECT_FILE_SIZE_LIMIT,
-    imageTransformation: false,
-    s3Protocol: Boolean(project.secrets?.s3_access_key_id && project.secrets?.s3_access_key_secret),
+    fileSizeLimit: env.storageFileSizeLimit,
+    imageTransformation: true,
+    s3Protocol: Boolean(env.s3ProtocolAccessKeyId && env.s3ProtocolAccessKeySecret),
     vectorBuckets: env.storageVectorsEnabled,
   })
 }
 
 export async function getS3ProtocolInfo(ref: string): Promise<S3ProtocolInfo | null> {
-  if (ref === 'default') {
-    const enabled = Boolean(env.s3ProtocolAccessKeyId && env.s3ProtocolAccessKeySecret)
-    return {
-      enabled,
-      access_key_id: enabled ? env.s3ProtocolAccessKeyId : null,
-      secret_access_key: enabled ? env.s3ProtocolAccessKeySecret : null,
-    }
-  }
-  const project = await getProject(ref)
-  if (!project || project.kind !== 'compose') return null
-  const keyId = project.secrets?.s3_access_key_id ?? null
-  const keySecret = project.secrets?.s3_access_key_secret ?? null
-  const enabled = Boolean(keyId && keySecret)
+  if (ref !== 'default') return null
+  const enabled = Boolean(env.s3ProtocolAccessKeyId && env.s3ProtocolAccessKeySecret)
   return {
     enabled,
-    access_key_id: enabled ? keyId : null,
-    secret_access_key: enabled ? keySecret : null,
+    access_key_id: enabled ? env.s3ProtocolAccessKeyId : null,
+    secret_access_key: enabled ? env.s3ProtocolAccessKeySecret : null,
   }
 }

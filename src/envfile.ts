@@ -3,7 +3,6 @@ import { dirname, join } from 'node:path'
 
 import { AUTH_CONFIG_KEYS } from './auth-config-keys.js'
 import { env } from './env.js'
-import { withSmtpFallback } from './mailer.js'
 import { type ConfigValue, getAllConfig, getAllEmailTemplates } from './store.js'
 
 export const MANAGED_ENV_FILE = '90-managed.env'
@@ -64,7 +63,7 @@ export type EnvFileOptions = {
 export function renderEnvFile(
   config: Record<string, ConfigValue>,
   templateTypes: string[],
-  options: EnvFileOptions = envFileOptionsFor('default')
+  options: EnvFileOptions = defaultEnvFileOptions()
 ): string {
   const lines: string[] = [
     '# Managed by supabase management-api. Do not edit by hand -',
@@ -110,48 +109,25 @@ export function renderEnvFile(
   return lines.join('\n') + '\n'
 }
 
-/**
- * Where the managed env file for a project's GoTrue lives: the default
- * stack uses the shared runtime-config volume, compose projects use the
- * `auth-config` directory of their stack (mounted at /etc/auth).
- */
-function authConfigDirFor(projectRef: string): string {
-  if (projectRef === 'default') return env.authConfigDir
-  return join(env.projectsDir, projectRef, 'auth-config')
-}
-
-function envFileOptionsFor(projectRef: string): EnvFileOptions {
-  if (projectRef === 'default') {
-    return {
-      callbackUrl: env.authCallbackUrl,
-      templateUrl: (type) => `${env.selfUrl}/templates/${type}`,
-    }
-  }
-  const publicBase = `${env.publicUrl.replace(/\/$/, '')}/proj/${projectRef}`
+function defaultEnvFileOptions(): EnvFileOptions {
   return {
-    callbackUrl: `${publicBase}/auth/v1/callback`,
-    templateUrl: (type) =>
-      `${env.selfUrl}/templates/${type}?ref=${encodeURIComponent(projectRef)}`,
+    callbackUrl: env.authCallbackUrl,
+    templateUrl: (type) => `${env.selfUrl}/templates/${type}`,
   }
 }
 
-/** Regenerates the watched env file for a project from the database state. */
-export async function syncEnvFile(projectRef: string = 'default'): Promise<void> {
-  const [storedConfig, templates] = await Promise.all([
-    getAllConfig(projectRef),
-    getAllEmailTemplates(projectRef),
+/** Regenerates the watched GoTrue env file from the database state. */
+export async function syncEnvFile(): Promise<void> {
+  const [config, templates] = await Promise.all([
+    getAllConfig('default'),
+    getAllEmailTemplates('default'),
   ])
-  // Projects without their own SMTP configuration inherit the default
-  // project's SMTP so auth emails work out of the box.
-  const config =
-    projectRef !== 'default' ? await withSmtpFallback(storedConfig) : storedConfig
   const content = renderEnvFile(
     config,
-    templates.map((t) => t.template_type),
-    envFileOptionsFor(projectRef)
+    templates.map((t) => t.template_type)
   )
 
-  const target = join(authConfigDirFor(projectRef), MANAGED_ENV_FILE)
+  const target = join(env.authConfigDir, MANAGED_ENV_FILE)
   await mkdir(dirname(target), { recursive: true })
   // Write-then-rename so GoTrue never reads a partially written file.
   const tmp = `${target}.tmp`

@@ -1,12 +1,9 @@
 import { lookup } from 'node:dns/promises'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { isIP } from 'node:net'
-import { dirname, join } from 'node:path'
-
-import pg from 'pg'
+import { dirname } from 'node:path'
 
 import { env } from './env.js'
-import { getProject } from './projects-store.js'
 import { pool } from './store.js'
 
 export type ThirdPartyIntegration = {
@@ -269,44 +266,20 @@ export async function syncThirdPartyJwks(projectRef: string = 'default'): Promis
     mode: 0o644,
   })
 
-  if (projectRef === 'default') {
-    // Older revisions of this service kept the key set in the role's config;
-    // that setting takes precedence over the file, so it is cleared.
-    await pool.query('alter role authenticator reset pgrst.jwt_secret').catch(() => undefined)
-    await pool.query(`notify pgrst, 'reload config'`)
-    return
-  }
-
-  // Project PostgREST listens for reload notifications on its own database.
-  const project = await getProject(projectRef)
-  if (!project || project.kind !== 'compose' || !project.secrets) return
-  const password = encodeURIComponent(project.secrets.postgres_password)
-  const client = new pg.Client({
-    connectionString: `postgresql://postgres:${password}@sbproj-${projectRef}-db:5432/postgres`,
-  })
-  try {
-    await client.connect()
-    await client.query(`notify pgrst, 'reload config'`)
-  } catch {
-    // The stack may still be coming up; PostgREST reads the file on start.
-  } finally {
-    await client.end().catch(() => undefined)
-  }
+  // Older revisions of this service kept the key set in the role's config;
+  // that setting takes precedence over the file, so it is cleared.
+  await pool.query('alter role authenticator reset pgrst.jwt_secret').catch(() => undefined)
+  await pool.query(`notify pgrst, 'reload config'`)
 }
 
-/** Where the trusted JWK set for a project's PostgREST lives. */
+/** Where the trusted JWK set for PostgREST lives. */
 function projectJwksFile(projectRef: string): string | null {
   if (projectRef === 'default') return env.postgrestJwksFile
-  if (!env.projectsDir) return null
-  return join(env.projectsDir, projectRef, 'postgrest', 'jwks.json')
+  return null
 }
 
-/** The project's own keys, trusted regardless of third-party integrations. */
+/** The stack's own keys, trusted regardless of third-party integrations. */
 async function baselineKeysFor(projectRef: string): Promise<unknown[]> {
   if (projectRef === 'default') return baselineKeys()
-  const project = await getProject(projectRef)
-  if (!project || !project.secrets) return []
-  return [
-    { kty: 'oct', k: base64Url(Buffer.from(project.secrets.jwt_secret, 'utf8')), alg: 'HS256' },
-  ]
+  return []
 }

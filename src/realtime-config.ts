@@ -1,7 +1,5 @@
 import { env } from './env.js'
 import { signJwtHS256 } from './jwt.js'
-import { getProject } from './projects-store.js'
-import { realtimeContainerName } from './provisioner.js'
 
 /** Tenant id seeded by Realtime's SEED_SELF_HOST (also the Host prefix). */
 const TENANT_ID = 'realtime-dev'
@@ -25,24 +23,12 @@ export type RealtimeConfig = Partial<Record<TenantField, unknown>>
 
 type RealtimeTarget = { baseUrl: string; jwtSecret: string }
 
-/**
- * Resolves the Realtime service and admin credentials for a project. The
- * default project uses the main stack's Realtime; compose projects use their
- * own. External projects have no Realtime service.
- */
+/** Resolves the stack's Realtime service and admin credentials. */
 async function resolveTarget(ref: string): Promise<RealtimeTarget | null> {
-  if (ref === 'default') {
-    if (!env.jwtSecret) return null
-    return {
-      baseUrl: `http://${env.realtimeHost}:${env.realtimePort}`,
-      jwtSecret: env.jwtSecret,
-    }
-  }
-  const project = await getProject(ref)
-  if (!project || project.kind !== 'compose' || !project.secrets) return null
+  if (ref !== 'default' || !env.jwtSecret) return null
   return {
-    baseUrl: `http://${realtimeContainerName(ref)}:${env.realtimePort}`,
-    jwtSecret: project.secrets.jwt_secret,
+    baseUrl: `http://${env.realtimeHost}:${env.realtimePort}`,
+    jwtSecret: env.jwtSecret,
   }
 }
 

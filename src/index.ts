@@ -66,14 +66,11 @@ import {
   writeManifestFile,
   writeSecretsFile,
 } from './functions.js'
-import { isSmtpConfigured, sendInvitationEmail, withSmtpFallback } from './mailer.js'
-import { handleProjectUpgrade, proxyProjectRequest } from './project-proxy.js'
+import { isSmtpConfigured, sendInvitationEmail } from './mailer.js'
 import { getRealtimeConfig, updateRealtimeConfig } from './realtime-config.js'
 import { getS3ProtocolInfo, getStorageConfig } from './storage-config.js'
 import {
   createOrganization,
-  createProjectRecord,
-  generateRef,
   getProject,
   listOrganizations,
   updateOrganization,
@@ -81,12 +78,6 @@ import {
   migrateProjects,
   type ProjectRecord,
 } from './projects-store.js'
-import {
-  deprovisionProject,
-  projectsConfigured,
-  provisionProject,
-  resumeProjects,
-} from './provisioner.js'
 import {
   getPostgresConfig,
   isManagedGuc,
@@ -240,15 +231,9 @@ function validateConfigPayload(payload: Record<string, unknown>): {
   return { valid, errors }
 }
 
-/**
- * Resolves which project an auth config request targets. The default stack
- * and compose projects run their own GoTrue; external projects have none.
- */
+/** Resolves which project an auth config request targets. */
 async function resolveAuthRef(ref: string): Promise<string | null> {
-  if (ref === 'default') return 'default'
-  const project = await getProject(ref)
-  if (!project || project.kind !== 'compose') return null
-  return ref
+  return ref === 'default' ? 'default' : null
 }
 
 async function applyConfigPatch(ref: string, payload: Record<string, unknown>) {
@@ -273,28 +258,8 @@ async function applyConfigPatch(ref: string, payload: Record<string, unknown>) {
   }
 
   await upsertConfig(ref, valid)
-  await syncEnvFile(ref)
+  await syncEnvFile()
   return { errors: [] as string[] }
-}
-
-/**
- * Static configuration a compose project's GoTrue container is generated
- * with (see provisioner.ts), mirrored so the dashboard shows the real
- * effective values before any runtime overrides exist.
- */
-function composeProjectBaseline(ref: string): Record<string, ConfigValue> {
-  const publicBase = `${env.publicUrl.replace(/\/$/, '')}/proj/${ref}`
-  return {
-    SITE_URL: env.publicUrl,
-    URI_ALLOW_LIST: '',
-    DISABLE_SIGNUP: false,
-    JWT_EXP: 3600,
-    EXTERNAL_EMAIL_ENABLED: true,
-    MAILER_AUTOCONFIRM: true,
-    EXTERNAL_PHONE_ENABLED: false,
-    SMS_AUTOCONFIRM: false,
-    API_EXTERNAL_URL: `${publicBase}/auth/v1`,
-  }
 }
 
 async function currentConfig(ref: string) {
@@ -305,13 +270,10 @@ async function currentConfig(ref: string) {
     if (/^MAILER_TEMPLATES_.+_CONTENT$/.test(key)) templatesCustom[key] = true
     else if (key.startsWith('MAILER_SUBJECTS_')) subjectsCustom[key] = true
   }
-  let merged = {
-    ...(ref === 'default' ? baselineConfig() : composeProjectBaseline(ref)),
+  const merged = {
+    ...baselineConfig(),
     ...stored,
   }
-  // Projects without their own SMTP inherit the default project's SMTP
-  // (mirrors the env file materialization in envfile.ts).
-  if (ref !== 'default') merged = await withSmtpFallback(merged)
   return {
     ...defaultAuthConfig(),
     ...merged,
@@ -370,7 +332,7 @@ app.post('/platform/auth/:ref/templates/:template/reset', async (c) => {
     `MAILER_TEMPLATES_${template.toUpperCase()}_CONTENT`,
     `MAILER_SUBJECTS_${template.toUpperCase()}`,
   ])
-  await syncEnvFile(ref)
+  await syncEnvFile()
   return c.json(await currentConfig(ref))
 })
 
@@ -406,7 +368,7 @@ app.put('/platform/auth/:ref/templates/:template/react', async (c) => {
   await upsertConfig(ref, {
     [`MAILER_TEMPLATES_${template.toUpperCase()}_CONTENT`]: renderedHtml,
   })
-  await syncEnvFile(ref)
+  await syncEnvFile()
   return c.json({ template_type: template, rendered_html: renderedHtml })
 })
 
@@ -437,25 +399,16 @@ const MAX_FUNCTION_BYTES = 10 * 1024 * 1024
 
 /**
  * Resolves the on-disk functions directory for a project. The default stack
- * uses the shared FUNCTIONS_DIR volume; compose projects have their own
- * `functions/` directory inside the project folder; external projects have no
- * edge runtime at all.
+ * uses the shared FUNCTIONS_DIR volume.
  */
 async function resolveFunctionsDir(
   ref: string
 ): Promise<{ dir: string } | { message: string; status: 404 | 501 }> {
-  if (ref === 'default') {
-    if (!env.functionsDir) {
-      return { message: 'edge functions management is not configured (FUNCTIONS_DIR)', status: 501 }
-    }
-    return { dir: env.functionsDir }
+  if (ref !== 'default') return { message: `project ${ref} not found`, status: 404 }
+  if (!env.functionsDir) {
+    return { message: 'edge functions management is not configured (FUNCTIONS_DIR)', status: 501 }
   }
-  const project = await getProject(ref)
-  if (!project) return { message: `project ${ref} not found`, status: 404 }
-  if (project.kind !== 'compose') {
-    return { message: 'this project has no edge functions runtime', status: 501 }
-  }
-  return { dir: path.join(env.projectsDir, ref, 'functions') }
+  return { dir: env.functionsDir }
 }
 
 /** Republishes per-function settings the `main` dispatcher enforces. */
@@ -903,104 +856,15 @@ function projectResponse(project: ProjectRecord) {
     ref: project.ref,
     name: project.name,
     organization_id: project.organization_id,
-    kind: project.kind,
+    kind: 'default',
     status: project.status,
     status_detail: project.status_detail,
     cloud_provider: 'localhost',
     region: 'local',
     inserted_at: new Date(project.inserted_at).toISOString(),
-    // Compose projects: services live in their own stack behind /proj/<ref>.
-    // External projects: only the database is managed.
-    endpoint:
-      project.kind === 'compose'
-        ? `${env.publicUrl.replace(/\/$/, '')}/proj/${project.ref}`
-        : null,
-    database:
-      project.kind === 'compose' && project.secrets
-        ? composeDatabaseMetadata(project)
-        : project.kind === 'external' && project.external_db_url
-          ? externalDatabaseMetadata(project.external_db_url)
-          : null,
+    endpoint: null,
+    database: null,
   }
-}
-
-/** Externally reachable Postgres endpoint for a compose project: the
- * deployment's public host plus the project's published port. Projects
- * created before port publishing fall back to the docker-network name. */
-function composeDatabaseMetadata(project: ProjectRecord) {
-  if (project.db_port === null) {
-    return {
-      host: `sbproj-${project.ref}-db`,
-      port: 5432,
-      user: 'postgres',
-      name: 'postgres',
-    }
-  }
-  return {
-    host: publicHostname(),
-    port: project.db_port,
-    user: 'postgres',
-    name: 'postgres',
-  }
-}
-
-function publicHostname(): string {
-  try {
-    return new URL(env.publicUrl).hostname
-  } catch {
-    return 'localhost'
-  }
-}
-
-/** Maps a connection failure to a safe, credential-free message. */
-function classifyConnectionError(err: unknown): string {
-  const code =
-    err !== null && typeof err === 'object' && 'code' in err && typeof err.code === 'string'
-      ? err.code
-      : ''
-  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return 'host not found'
-  if (code === 'ECONNREFUSED') return 'connection refused'
-  if (code === 'ETIMEDOUT' || code === 'ECONNRESET') return 'connection timed out'
-  if (code === '28P01' || code === '28000') return 'authentication failed'
-  if (code === '3D000') return 'database does not exist'
-  if (err instanceof Error && /tenant/i.test(err.message)) {
-    return 'the host is a Supavisor pooler that requires a tenant-qualified user (postgres.<tenant>); connect to the database port directly or qualify the username'
-  }
-  if (err instanceof Error && /timeout/i.test(err.message)) return 'connection timed out'
-  return 'connection failed'
-}
-
-/** Non-secret connection metadata for an external database URL. */
-function externalDatabaseMetadata(dbUrl: string) {
-  try {
-    const url = new URL(dbUrl)
-    return {
-      host: url.hostname,
-      port: url.port ? Number(url.port) : 5432,
-      user: url.username ? decodeURIComponent(url.username) : 'postgres',
-      name: url.pathname.replace(/^\//, '') || 'postgres',
-    }
-  } catch {
-    return null
-  }
-}
-
-/** Full connection string for a project's database. Never included in
- * project list/detail responses; callers fetch it explicitly. */
-function projectConnectionString(project: ProjectRecord): string | null {
-  if (project.kind === 'compose' && project.secrets) {
-    const password = encodeURIComponent(project.secrets.postgres_password)
-    // Prefer the published host port so the string works from outside Docker;
-    // projects created before port publishing only have the internal endpoint.
-    if (project.db_port !== null) {
-      return `postgresql://postgres:${password}@${publicHostname()}:${project.db_port}/postgres`
-    }
-    return `postgresql://postgres:${password}@sbproj-${project.ref}-db:5432/postgres`
-  }
-  if (project.kind === 'external' && project.external_db_url) {
-    return project.external_db_url
-  }
-  return null
 }
 
 app.get('/platform/organizations', async (c) => {
@@ -1047,77 +911,10 @@ app.get('/platform/projects', async (c) => {
 })
 
 app.post('/platform/projects', async (c) => {
-  if (!(await canAdminister(c))) {
-    return c.json({ message: 'only owners and admins can create projects' }, 403)
-  }
-  const payload = await c
-    .req
-    .json<{
-      name?: string
-      organization_id?: number
-      kind?: string
-      db_connection_string?: string
-    }>()
-    .catch(() => null)
-  if (!payload?.name || typeof payload.name !== 'string') {
-    return c.json({ message: 'body must contain a `name` string' }, 400)
-  }
-  const organizationId =
-    typeof payload.organization_id === 'number' ? payload.organization_id : 1
-  const kind = payload.kind ?? 'compose'
-
-  if (kind === 'external') {
-    const dbUrl = payload.db_connection_string
-    if (!dbUrl || typeof dbUrl !== 'string' || !/^postgres(ql)?:\/\//.test(dbUrl)) {
-      return c.json(
-        { message: 'external projects need a postgres:// `db_connection_string`' },
-        400
-      )
-    }
-    let parsedDbUrl: URL
-    try {
-      parsedDbUrl = new URL(dbUrl)
-    } catch {
-      return c.json({ message: 'invalid database connection string' }, 400)
-    }
-    if (!parsedDbUrl.hostname) {
-      return c.json({ message: 'database connection string must include a host' }, 400)
-    }
-    const probe = new pg.Client({
-      connectionString: dbUrl,
-      connectionTimeoutMillis: 10_000,
-    })
-    try {
-      await probe.connect()
-      await probe.query('select 1')
-    } catch (err) {
-      // pg errors can echo parts of the connection string; return only a
-      // stable classification of the failure.
-      const message = classifyConnectionError(err)
-      return c.json({ message: `could not connect to database: ${message}` }, 400)
-    } finally {
-      await probe.end().catch(() => {})
-    }
-    const record = await createProjectRecord({
-      ref: generateRef(),
-      name: payload.name,
-      organizationId,
-      kind: 'external',
-      externalDbUrl: dbUrl,
-      status: 'ACTIVE_HEALTHY',
-    })
-    return c.json(projectResponse(record), 201)
-  }
-
-  if (kind !== 'compose') return c.json({ message: `unknown project kind: ${kind}` }, 400)
-  if (!projectsConfigured()) {
-    return c.json(
-      { message: 'project provisioning is not configured (PROJECTS_DIR / PROJECTS_HOST_DIR)' },
-      501
-    )
-  }
-  const record = await provisionProject({ name: payload.name, organizationId })
-  return c.json(projectResponse(record), 201)
+  return c.json(
+    { message: 'self-hosted Supabase runs a single project; creating projects is not supported' },
+    501
+  )
 })
 
 app.get('/platform/projects/:ref', async (c) => {
@@ -1126,43 +923,20 @@ app.get('/platform/projects/:ref', async (c) => {
   return c.json(projectResponse(project))
 })
 
-app.get('/platform/projects/:ref/connection-string', async (c) => {
-  const project = await getProject(c.req.param('ref'))
-  if (!project) return c.json({ message: 'project not found' }, 404)
-  const connectionString = projectConnectionString(project)
-  if (connectionString === null) {
-    return c.json({ message: 'project has no managed database' }, 404)
-  }
-  return c.json({ connection_string: connectionString })
-})
-
 app.get('/platform/projects/:ref/api-keys', async (c) => {
   const project = await getProject(c.req.param('ref'))
   if (!project) return c.json({ message: 'project not found' }, 404)
-  if (!project.secrets) return c.json([])
-  return c.json([
-    { name: 'anon key', api_key: project.secrets.anon_key, tags: 'anon' },
-    { name: 'service_role key', api_key: project.secrets.service_role_key, tags: 'service_role' },
-  ])
+  return c.json([])
 })
 
 app.delete('/platform/projects/:ref', async (c) => {
   if (!(await canAdminister(c))) {
     return c.json({ message: 'only owners and admins can delete projects' }, 403)
   }
-  const ref = c.req.param('ref')
-  const project = await getProject(ref)
+  const project = await getProject(c.req.param('ref'))
   if (!project) return c.json({ message: 'project not found' }, 404)
-  if (project.kind === 'default') {
-    return c.json({ message: 'the default project cannot be deleted' }, 400)
-  }
-  await deprovisionProject(ref)
-  return c.json({ ref })
+  return c.json({ message: 'the default project cannot be deleted' }, 400)
 })
-
-// Per-project API traffic (rest/auth/storage/functions), routed here by the
-// gateway. The project's own services authenticate each request.
-app.all('/proj/:ref/*', proxyProjectRequest)
 
 // -- Storage configuration --------------------------------------------------
 
@@ -1557,14 +1331,8 @@ app.delete('/platform/dashboard-users/invitations/:id', async (c) => {
 // -- PostgREST configuration --------------------------------------------
 
 app.get('/platform/projects/:ref/config/postgrest', async (c) => {
-  const ref = c.req.param('ref')
-  const config = await getPostgrestConfig(ref)
+  const config = await getPostgrestConfig(c.req.param('ref'))
   if (!config) return c.json({ message: 'PostgREST is not available for this project' }, 404)
-  if (ref === 'default') return c.json(config)
-  // Compose projects sign tokens with their own secret; the dashboard's API
-  // settings page reads it from this response, like on the default stack.
-  const project = await getProject(ref)
-  if (project?.secrets) return c.json({ ...config, jwt_secret: project.secrets.jwt_secret })
   return c.json(config)
 })
 
@@ -1643,25 +1411,13 @@ async function main() {
   await migrateDashboardUsers()
   await migrateAuditLogs()
   await syncEnvFile()
-  // Project GoTrue env files derive from stored config plus the default
-  // project's SMTP fallback, so refresh them whenever this service restarts.
-  for (const project of await listProjects()) {
-    if (project.kind !== 'compose') continue
-    await syncEnvFile(project.ref).catch((err) =>
-      console.error(`failed to sync env file for ${project.ref}:`, err)
-    )
-  }
   // PostgREST reads its trusted key set from a file this service owns, so it
   // has to exist (with the stack's own keys) before PostgREST starts.
   await syncThirdPartyJwks()
   if (env.functionsDir) await syncFunctionManifest('default', env.functionsDir)
-  const server = serve({ fetch: app.fetch, port: env.port }, (info) => {
+  serve({ fetch: app.fetch, port: env.port }, (info) => {
     console.log(`management-api listening on :${info.port}`)
   })
-  // Websocket upgrades (project Realtime) bypass Hono's fetch adapter.
-  server.on('upgrade', handleProjectUpgrade)
-  // Bring project stacks back up after a host/daemon restart, in background.
-  void resumeProjects().catch((err) => console.error('resuming projects failed:', err))
 }
 
 main().catch((err) => {

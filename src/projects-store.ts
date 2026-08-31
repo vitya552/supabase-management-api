@@ -1,41 +1,15 @@
 import { randomBytes } from 'node:crypto'
 
-import { decryptString, encryptString, isEncrypted } from './crypto.js'
 import { pool } from './store.js'
 
-export type ProjectKind = 'default' | 'compose' | 'external'
-
-export type ProjectStatus =
-  | 'ACTIVE_HEALTHY'
-  | 'COMING_UP'
-  | 'GOING_DOWN'
-  | 'INIT_FAILED'
-  | 'REMOVED'
-
-export type ProjectSecrets = {
-  postgres_password: string
-  jwt_secret: string
-  anon_key: string
-  service_role_key: string
-  /** Absent on projects provisioned before Realtime support. */
-  secret_key_base?: string
-  /** Absent on projects provisioned before S3 protocol support. */
-  s3_access_key_id?: string
-  s3_access_key_secret?: string
-}
+export type ProjectStatus = 'ACTIVE_HEALTHY' | 'COMING_UP' | 'GOING_DOWN' | 'INIT_FAILED'
 
 export type ProjectRecord = {
   id: number
   ref: string
   name: string
   organization_id: number
-  kind: ProjectKind
   status: ProjectStatus
-  /** External projects only: full Postgres connection string. */
-  external_db_url: string | null
-  /** Compose projects only: host port published for the project's Postgres. */
-  db_port: number | null
-  secrets: ProjectSecrets | null
   status_detail: string | null
   inserted_at: Date
   updated_at: Date
@@ -86,122 +60,22 @@ export async function migrateProjects(): Promise<void> {
   `)
 }
 
-const SECRET_CONTEXT = 'project-secrets'
-const EXTERNAL_DB_CONTEXT = 'project-external-db'
-
-function rowToProject(row: {
-  id: number
-  ref: string
-  name: string
-  organization_id: number
-  kind: ProjectKind
-  status: ProjectStatus
-  external_db_url: string | null
-  db_port: number | null
-  secrets: string | null
-  status_detail: string | null
-  inserted_at: Date
-  updated_at: Date
-}): ProjectRecord {
-  return {
-    ...row,
-    external_db_url:
-      row.external_db_url !== null && isEncrypted(row.external_db_url)
-        ? decryptString(row.external_db_url, EXTERNAL_DB_CONTEXT)
-        : row.external_db_url,
-    secrets:
-      typeof row.secrets === 'string' && isEncrypted(row.secrets)
-        ? (JSON.parse(decryptString(row.secrets, SECRET_CONTEXT)) as ProjectSecrets)
-        : null,
-  }
-}
+const PROJECT_COLUMNS =
+  'id, ref, name, organization_id, status, status_detail, inserted_at, updated_at'
 
 export async function listProjects(): Promise<ProjectRecord[]> {
   const { rows } = await pool.query(
-    `select * from management.projects where status <> 'REMOVED' order by id`
+    `select ${PROJECT_COLUMNS} from management.projects where kind = 'default' order by id`
   )
-  return rows.map(rowToProject)
+  return rows
 }
 
 export async function getProject(ref: string): Promise<ProjectRecord | null> {
   const { rows } = await pool.query(
-    `select * from management.projects where ref = $1 and status <> 'REMOVED'`,
+    `select ${PROJECT_COLUMNS} from management.projects where ref = $1 and kind = 'default'`,
     [ref]
   )
-  return rows[0] ? rowToProject(rows[0]) : null
-}
-
-/**
- * Superuser connection string for a project's database, reachable from
- * inside the docker network. Returns null for unknown projects.
- */
-export async function projectDatabaseUrl(ref: string): Promise<string | null> {
-  if (ref === 'default') return null
-  const project = await getProject(ref)
-  if (!project) return null
-  if (project.kind === 'compose' && project.secrets) {
-    const password = encodeURIComponent(project.secrets.postgres_password)
-    return `postgresql://postgres:${password}@sbproj-${ref}-db:5432/postgres`
-  }
-  if (project.kind === 'external' && project.external_db_url) return project.external_db_url
-  return null
-}
-
-export async function createProjectRecord(input: {
-  ref: string
-  name: string
-  organizationId: number
-  kind: 'compose' | 'external'
-  externalDbUrl?: string
-  dbPort?: number
-  secrets?: ProjectSecrets
-  status: ProjectStatus
-}): Promise<ProjectRecord> {
-  const { rows } = await pool.query(
-    `insert into management.projects
-       (ref, name, organization_id, kind, status, external_db_url, db_port, secrets)
-     values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
-     returning *`,
-    [
-      input.ref,
-      input.name,
-      input.organizationId,
-      input.kind,
-      input.status,
-      input.externalDbUrl ? encryptString(input.externalDbUrl, EXTERNAL_DB_CONTEXT) : null,
-      input.dbPort ?? null,
-      input.secrets
-        ? JSON.stringify(encryptString(JSON.stringify(input.secrets), SECRET_CONTEXT))
-        : null,
-    ]
-  )
-  return rowToProject(rows[0])
-}
-
-/** First free published Postgres port for a new compose project. Ports start
- * right after the pooler's 5432/6543 range used by the default stack. */
-export async function allocateDbPort(): Promise<number> {
-  const { rows } = await pool.query(
-    'select coalesce(max(db_port), 54329) + 1 as next from management.projects'
-  )
-  return Number(rows[0].next)
-}
-
-export async function updateProjectStatus(
-  ref: string,
-  status: ProjectStatus,
-  detail: string | null = null
-): Promise<void> {
-  await pool.query(
-    `update management.projects
-       set status = $2, status_detail = $3, updated_at = now()
-     where ref = $1`,
-    [ref, status, detail]
-  )
-}
-
-export async function deleteProjectRecord(ref: string): Promise<void> {
-  await pool.query(`delete from management.projects where ref = $1`, [ref])
+  return rows[0] ?? null
 }
 
 export async function listOrganizations(): Promise<OrganizationRecord[]> {
@@ -245,15 +119,4 @@ export async function createOrganization(name: string): Promise<OrganizationReco
     [slug, name]
   )
   return rows[0]
-}
-
-const REF_ALPHABET = 'abcdefghijklmnopqrstuvwxyz'
-const REF_ALPHANUM = 'abcdefghijklmnopqrstuvwxyz0123456789'
-
-/** 20-char lowercase ref, same shape as hosted project refs. */
-export function generateRef(): string {
-  const bytes = randomBytes(20)
-  let out = REF_ALPHABET[bytes[0] % REF_ALPHABET.length]
-  for (let i = 1; i < 20; i++) out += REF_ALPHANUM[bytes[i] % REF_ALPHANUM.length]
-  return out
 }

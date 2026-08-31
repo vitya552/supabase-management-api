@@ -40,57 +40,6 @@ export async function isSmtpConfigured(): Promise<boolean> {
   return (await getSmtpSettings()) !== null
 }
 
-const SMTP_FALLBACK_KEYS = [
-  'SMTP_HOST',
-  'SMTP_PORT',
-  'SMTP_USER',
-  'SMTP_PASS',
-  'SMTP_ADMIN_EMAIL',
-  'SMTP_SENDER_NAME',
-] as const
-
-/**
- * The default project's effective SMTP settings, inherited by projects
- * that have no SMTP configuration of their own.
- */
-export async function defaultSmtpFallback(): Promise<Record<string, ConfigValue>> {
-  const config = { ...baselineConfig(), ...(await getAllConfig('default')) }
-  if (!asString(config.SMTP_HOST) || !asString(config.SMTP_ADMIN_EMAIL)) return {}
-  const out: Record<string, ConfigValue> = {}
-  for (const key of SMTP_FALLBACK_KEYS) {
-    const value = config[key]
-    if (value !== undefined && value !== null) out[key] = value
-  }
-  return out
-}
-
-/** Whether a project's own config has usable SMTP settings (empty strings count as unset). */
-export function hasOwnSmtp(config: Record<string, ConfigValue>): boolean {
-  return asString(config.SMTP_HOST) !== ''
-}
-
-/**
- * Fills missing/empty SMTP keys from the default project's settings.
- * Projects with their own SMTP host are returned unchanged.
- */
-export async function withSmtpFallback(
-  config: Record<string, ConfigValue>
-): Promise<Record<string, ConfigValue>> {
-  if (hasOwnSmtp(config)) return config
-  const fallback = await defaultSmtpFallback()
-  if (Object.keys(fallback).length === 0) return config
-  const merged = { ...config }
-  for (const key of SMTP_FALLBACK_KEYS) {
-    const fallbackValue = fallback[key]
-    if (fallbackValue === undefined) continue
-    const current = merged[key]
-    if (current === undefined || current === null || current === '') {
-      merged[key] = fallbackValue
-    }
-  }
-  return merged
-}
-
 /** Sends a dashboard invitation email. Returns false when SMTP is not
  * configured; throws when SMTP is configured but delivery fails. */
 export async function sendInvitationEmail(input: {
