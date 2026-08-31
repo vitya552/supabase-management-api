@@ -1643,6 +1643,14 @@ async function main() {
   await migrateDashboardUsers()
   await migrateAuditLogs()
   await syncEnvFile()
+  // Project GoTrue env files derive from stored config plus the default
+  // project's SMTP fallback, so refresh them whenever this service restarts.
+  for (const project of await listProjects()) {
+    if (project.kind !== 'compose') continue
+    await syncEnvFile(project.ref).catch((err) =>
+      console.error(`failed to sync env file for ${project.ref}:`, err)
+    )
+  }
   // PostgREST reads its trusted key set from a file this service owns, so it
   // has to exist (with the stack's own keys) before PostgREST starts.
   await syncThirdPartyJwks()
