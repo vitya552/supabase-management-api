@@ -68,8 +68,11 @@ import { isSmtpConfigured, sendInvitationEmail } from './mailer.js'
 import { getRealtimeConfig, updateRealtimeConfig } from './realtime-config.js'
 import { getS3ProtocolInfo, getStorageConfig } from './storage-config.js'
 import {
+  getOrganizationMfaEnforced,
   getProject,
+  isMfaEnforcedAnywhere,
   listOrganizations,
+  setOrganizationMfaEnforced,
   updateOrganization,
   listProjects,
   migrateProjects,
@@ -159,6 +162,37 @@ app.use('/platform/*', async (c, next) => {
     status: c.res.status,
     projectRef: refMatch ? refMatch[1] : null,
   }).catch((err) => console.error('failed to record audit log:', err))
+})
+
+// Routes members without MFA may still reach while enforcement is on: their
+// own account pages (to enroll a factor) and the org member/MFA endpoints
+// that the Security page and team list need to render.
+const MFA_EXEMPT_PREFIXES = ['/platform/profile', '/platform/dashboard-users']
+const MFA_EXEMPT_PATTERN = /^\/platform\/organizations(\/[^/]+(\/members\/mfa\/enforcement)?)?$/
+
+// Organization MFA enforcement: members without a verified factor keep access
+// to their account pages only, until they enroll one.
+app.use('/platform/*', async (c, next) => {
+  const path = c.req.path
+  const isExempt =
+    MFA_EXEMPT_PREFIXES.some((prefix) => path.startsWith(prefix)) ||
+    MFA_EXEMPT_PATTERN.test(path)
+  if (!isExempt && (await isMfaEnforcedAnywhere())) {
+    const identity = await requestIdentity(c)
+    if (identity === 'invalid') {
+      return c.json({ message: 'session is no longer valid' }, 401)
+    }
+    if (identity && !(await hasVerifiedFactor(identity.username))) {
+      return c.json(
+        {
+          message:
+            'Your organization requires MFA. Enable it under Account > Security, then sign in again.',
+        },
+        403
+      )
+    }
+  }
+  await next()
 })
 
 /**
@@ -929,6 +963,35 @@ app.patch('/platform/organizations/:slug', async (c) => {
   return c.json(updated)
 })
 
+app.get('/platform/organizations/:slug/members/mfa/enforcement', async (c) => {
+  const enforced = await getOrganizationMfaEnforced(c.req.param('slug'))
+  if (enforced === null) return c.json({ message: 'organization not found' }, 404)
+  return c.json({ enforced })
+})
+
+app.patch('/platform/organizations/:slug/members/mfa/enforcement', async (c) => {
+  if (!(await canAdminister(c))) {
+    return c.json({ message: 'only owners and admins can update MFA enforcement' }, 403)
+  }
+  const payload = await c.req.json<{ enforced?: boolean }>().catch(() => null)
+  if (!payload || typeof payload.enforced !== 'boolean') {
+    return c.json({ message: '`enforced` must be a boolean' }, 400)
+  }
+  // Members enforcing MFA must have it enabled themselves, mirroring Cloud.
+  if (payload.enforced) {
+    const identity = await requestIdentity(c)
+    if (identity && identity !== 'invalid' && !(await hasVerifiedFactor(identity.username))) {
+      return c.json(
+        { message: 'Enable MFA on your own account before enforcing it for the organization' },
+        403
+      )
+    }
+  }
+  const enforced = await setOrganizationMfaEnforced(c.req.param('slug'), payload.enforced)
+  if (enforced === null) return c.json({ message: 'organization not found' }, 404)
+  return c.json({ enforced })
+})
+
 app.post('/platform/organizations', async (c) => {
   return c.json(
     {
@@ -1034,7 +1097,7 @@ app.get('/platform/dashboard-users', async (c) => {
         role: 'owner',
         first_name: '',
         last_name: '',
-        mfa_enabled: false,
+        mfa_enabled: mfaUsernames.has(env.dashboardUsername),
         inserted_at: '',
       },
       ...withMfa,

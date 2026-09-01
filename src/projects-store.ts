@@ -57,6 +57,8 @@ export async function migrateProjects(): Promise<void> {
       add column if not exists opt_in_tags jsonb not null default '[]'::jsonb;
     alter table management.projects
       add column if not exists db_port int;
+    alter table management.organizations
+      add column if not exists mfa_enforced boolean not null default false;
   `)
 }
 
@@ -106,6 +108,33 @@ export async function updateOrganization(
     [slug, patch.name ?? null, patch.opt_in_tags ? JSON.stringify(patch.opt_in_tags) : null]
   )
   return rows[0] ?? null
+}
+
+export async function getOrganizationMfaEnforced(slug: string): Promise<boolean | null> {
+  const { rows } = await pool.query(
+    'select mfa_enforced from management.organizations where slug = $1',
+    [slug]
+  )
+  return rows[0]?.mfa_enforced ?? null
+}
+
+export async function setOrganizationMfaEnforced(
+  slug: string,
+  enforced: boolean
+): Promise<boolean | null> {
+  const { rows } = await pool.query(
+    'update management.organizations set mfa_enforced = $2 where slug = $1 returning mfa_enforced',
+    [slug, enforced]
+  )
+  return rows[0]?.mfa_enforced ?? null
+}
+
+/** True when any organization requires members to have MFA enabled. */
+export async function isMfaEnforcedAnywhere(): Promise<boolean> {
+  const { rows } = await pool.query(
+    'select 1 from management.organizations where mfa_enforced limit 1'
+  )
+  return rows.length > 0
 }
 
 export async function createOrganization(name: string): Promise<OrganizationRecord> {
