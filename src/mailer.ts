@@ -17,7 +17,7 @@ function asString(value: ConfigValue | undefined): string {
 }
 
 /** Effective SMTP settings: runtime overrides on top of the stack's env
- * baseline — the same values GoTrue uses for auth emails. */
+ * baseline - the same values GoTrue uses for auth emails. */
 export async function getSmtpSettings(): Promise<SmtpSettings | null> {
   // Dashboard emails (team invitations) always go through the main stack's
   // SMTP configuration, which lives under the default project.
