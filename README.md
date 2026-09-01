@@ -3,11 +3,11 @@
 A small local management server that brings cloud-style runtime configuration to
 self-hosted Supabase. It currently manages the Auth (GoTrue) service:
 
-- **Runtime Auth configuration** — configure OAuth providers, SMTP, MFA, rate
+- **Runtime Auth configuration** - configure OAuth providers, SMTP, MFA, rate
   limits, email subjects/templates, auth hooks and everything else exposed by
   the dashboard's Authentication pages, without editing `.env` files or
   restarting containers.
-- **React email templates** — upload [react-email](https://react.email)
+- **React email templates** - upload [react-email](https://react.email)
   components; they are rendered to HTML and served to GoTrue on the fly.
 
 There is no clustering or multi-project support: it is a single-tenant local
@@ -35,7 +35,7 @@ The management API persists configuration in Postgres and materializes it as
 `90-managed.env` in a volume shared with the auth container. Values in that
 file override the container's static environment (`godotenv.Overload`), so the
 compose `.env` remains the baseline and runtime changes take effect within
-seconds — no restarts, no manual env editing.
+seconds - no restarts, no manual env editing.
 
 Email template *content* cannot be passed through env vars (GoTrue only
 accepts template URLs), so the service stores the content and serves it at
@@ -85,7 +85,7 @@ substitutes at send time. See `emails/confirmation-example.tsx`.
 
 Deploy (multipart, same contract as the platform `functions/deploy` endpoint),
 list, update, and delete functions. Files are written atomically into the
-functions volume shared with edge-runtime, which picks them up per request —
+functions volume shared with edge-runtime, which picks them up per request -
 no restarts and no manual file creation.
 
 ```bash
@@ -113,7 +113,7 @@ curl -X POST "http://localhost:8085/platform/projects/default/secrets" \
 
 Runtime updates to exposed schemas, max rows, extra search path, and pool
 size, applied via `ALTER ROLE authenticator SET pgrst.*` +
-`NOTIFY pgrst, 'reload config'` — no env edits or restarts.
+`NOTIFY pgrst, 'reload config'` - no env edits or restarts.
 
 ```bash
 curl -X PATCH "http://localhost:8085/platform/projects/default/config/postgrest" \
@@ -143,13 +143,13 @@ curl -X PUT "http://localhost:8085/platform/projects/default/config/database/pos
 | Var | Default | Description |
 | --- | --- | --- |
 | `PORT` | `8085` | Listen port |
-| `DATABASE_URL` | — (required) | Postgres connection string for persistence |
-| `MANAGEMENT_API_TOKEN` | — (required) | Bearer token for `/platform` endpoints |
+| `DATABASE_URL` | - (required) | Postgres connection string for persistence |
+| `MANAGEMENT_API_TOKEN` | - (required) | Bearer token for `/platform` endpoints |
 | `AUTH_CONFIG_DIR` | `/etc/auth-runtime` | Directory watched by GoTrue |
 | `SELF_URL` | `http://management-api:8085` | This service's URL as seen by GoTrue |
 | `AUTH_CALLBACK_URL` | `${API_EXTERNAL_URL}/auth/v1/callback` | OAuth redirect URI advertised for enabled providers |
-| `AUTH_DEFAULT_*` | — | Baseline values shown before any runtime override exists (e.g. `AUTH_DEFAULT_SITE_URL`) |
-| `FUNCTIONS_DIR` | — | Shared edge functions volume; unset disables function management |
+| `AUTH_DEFAULT_*` | - | Baseline values shown before any runtime override exists (e.g. `AUTH_DEFAULT_SITE_URL`) |
+| `FUNCTIONS_DIR` | - | Shared edge functions volume; unset disables function management |
 | `PGRST_DB_SCHEMAS` / `PGRST_DB_MAX_ROWS` / `PGRST_DB_EXTRA_SEARCH_PATH` | mirrors postgrest service | Env defaults reported until overridden at runtime |
 
 ## Development
