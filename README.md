@@ -152,6 +152,28 @@ curl -X PUT "http://localhost:8085/platform/projects/default/config/database/pos
 | `FUNCTIONS_DIR` | — | Shared edge functions volume; unset disables function management |
 | `PGRST_DB_SCHEMAS` / `PGRST_DB_MAX_ROWS` / `PGRST_DB_EXTRA_SEARCH_PATH` | mirrors postgrest service | Env defaults reported until overridden at runtime |
 
+## Branches
+
+- `main` - default-only version: single `default` project, no multi-tenancy.
+  This is the supported configuration and the one deployed with the fork's
+  docker compose stack.
+- `multiproject` - the experimental multi-project version (project
+  provisioning via docker socket, per-project Envoy routing, external DBs as
+  projects). Build it yourself if you want multi-tenancy; it is not mixed
+  into `main` and not supported.
+
+To build either variant into the self-hosted stack, copy the tree over
+`docker/management-api` in the Supabase fork and rebuild the image:
+
+```bash
+docker compose -f docker/docker-compose.yml build management-api
+docker compose -f docker/docker-compose.yml up -d management-api
+```
+
+Rollback = check out the previous commit of the branch you deployed and
+rebuild the image; configuration lives in Postgres (schema `management`) and
+survives image swaps.
+
 ## Development
 
 ```bash
