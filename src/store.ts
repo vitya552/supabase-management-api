@@ -7,6 +7,23 @@ export const pool = new pg.Pool({ connectionString: env.databaseUrl })
 
 export type ConfigValue = string | number | boolean | null
 
+export type Queryable = Pick<pg.Pool, 'query'>
+
+export async function withTransaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T> {
+  const client = await pool.connect()
+  try {
+    await client.query('begin')
+    const result = await fn(client)
+    await client.query('commit')
+    return result
+  } catch (err) {
+    await client.query('rollback')
+    throw err
+  } finally {
+    client.release()
+  }
+}
+
 export async function migrate(): Promise<void> {
   await pool.query(`
     create schema if not exists management;
@@ -238,17 +255,17 @@ export async function deleteFunctionSecrets(projectRef: string, names: string[])
   )
 }
 
-export async function getAllConfig(projectRef: string): Promise<Record<string, ConfigValue>> {
-  const { rows } = await pool.query(
+export async function getAllConfig(
+  projectRef: string,
+  db: Queryable = pool
+): Promise<Record<string, ConfigValue>> {
+  const { rows } = await db.query(
     'select key, value from management.auth_config where project_ref = $1',
     [projectRef]
   )
   const out: Record<string, ConfigValue> = {}
   for (const row of rows) {
     const value = row.value
-    // Only values stored under sensitive keys are encrypted, so a plain string
-    // that merely looks like a ciphertext under any other key is passed through
-    // untouched instead of failing the whole read.
     if (isSensitiveConfigKey(row.key) && typeof value === 'string' && isEncrypted(value)) {
       out[row.key] = JSON.parse(decryptString(value, row.key))
     } else {
@@ -260,49 +277,47 @@ export async function getAllConfig(projectRef: string): Promise<Record<string, C
 
 export async function upsertConfig(
   projectRef: string,
-  entries: Record<string, ConfigValue>
+  entries: Record<string, ConfigValue>,
+  db?: Queryable
 ): Promise<void> {
   const keys = Object.keys(entries)
   if (keys.length === 0) return
-  const client = await pool.connect()
-  try {
-    await client.query('begin')
+  const run = async (tx: Queryable) => {
     for (const key of keys) {
       const value = entries[key]
       if (value === null) {
-        await client.query(
-          'delete from management.auth_config where project_ref = $1 and key = $2',
-          [projectRef, key]
-        )
+        await tx.query('delete from management.auth_config where project_ref = $1 and key = $2', [
+          projectRef,
+          key,
+        ])
       } else {
         const serialized = isSensitiveConfigKey(key)
           ? JSON.stringify(encryptString(JSON.stringify(value), key))
           : JSON.stringify(value)
-        await client.query(
+        await tx.query(
           `insert into management.auth_config (project_ref, key, value) values ($1, $2, $3::jsonb)
            on conflict (project_ref, key) do update set value = excluded.value, updated_at = now()`,
           [projectRef, key, serialized]
         )
       }
     }
-    await client.query('commit')
-  } catch (err) {
-    await client.query('rollback')
-    throw err
-  } finally {
-    client.release()
   }
+  if (db) await run(db)
+  else await withTransaction(run)
 }
 
-export async function deleteConfig(projectRef: string, keys: string[]): Promise<void> {
+export async function deleteConfig(
+  projectRef: string,
+  keys: string[],
+  db: Queryable = pool
+): Promise<void> {
   if (keys.length === 0) return
-  await pool.query(
+  await db.query(
     'delete from management.auth_config where project_ref = $1 and key = any($2)',
     [projectRef, keys]
   )
 }
 
-/** Removes all auth config and templates belonging to a project (deprovision). */
 export async function deleteProjectAuthData(projectRef: string): Promise<void> {
   await pool.query('delete from management.auth_config where project_ref = $1', [projectRef])
   await pool.query('delete from management.email_templates where project_ref = $1', [projectRef])
@@ -317,17 +332,21 @@ export type EmailTemplate = {
 
 export async function getEmailTemplate(
   projectRef: string,
-  templateType: string
+  templateType: string,
+  db: Queryable = pool
 ): Promise<EmailTemplate | null> {
-  const { rows } = await pool.query(
+  const { rows } = await db.query(
     'select template_type, source, source_format, rendered_html from management.email_templates where project_ref = $1 and template_type = $2',
     [projectRef, templateType]
   )
   return rows[0] ?? null
 }
 
-export async function getAllEmailTemplates(projectRef: string): Promise<EmailTemplate[]> {
-  const { rows } = await pool.query(
+export async function getAllEmailTemplates(
+  projectRef: string,
+  db: Queryable = pool
+): Promise<EmailTemplate[]> {
+  const { rows } = await db.query(
     'select template_type, source, source_format, rendered_html from management.email_templates where project_ref = $1',
     [projectRef]
   )
@@ -336,9 +355,10 @@ export async function getAllEmailTemplates(projectRef: string): Promise<EmailTem
 
 export async function upsertEmailTemplate(
   projectRef: string,
-  template: EmailTemplate
+  template: EmailTemplate,
+  db: Queryable = pool
 ): Promise<void> {
-  await pool.query(
+  await db.query(
     `insert into management.email_templates (project_ref, template_type, source, source_format, rendered_html)
      values ($1, $2, $3, $4, $5)
      on conflict (project_ref, template_type) do update
@@ -358,9 +378,10 @@ export async function upsertEmailTemplate(
 
 export async function deleteEmailTemplate(
   projectRef: string,
-  templateType: string
+  templateType: string,
+  db: Queryable = pool
 ): Promise<void> {
-  await pool.query(
+  await db.query(
     'delete from management.email_templates where project_ref = $1 and template_type = $2',
     [projectRef, templateType]
   )

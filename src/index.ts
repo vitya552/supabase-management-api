@@ -1,5 +1,6 @@
 import { serve } from '@hono/node-server'
-import { Hono } from 'hono'
+import { Hono, type Context } from 'hono'
+import { bodyLimit } from 'hono/body-limit'
 import { logger } from 'hono/logger'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
@@ -51,7 +52,7 @@ import {
   verifyDashboardUser,
 } from './dashboard-users.js'
 import { listAuditLogs, migrateAuditLogs, recordAuditLog } from './audit-log.js'
-import { renderReactEmail } from './emails.js'
+import { RenderQueueFullError, renderReactEmail } from './emails.js'
 import { generateTotpSecret, totpUri, verifyTotpCode } from './totp.js'
 import { defaultAuthConfig } from './gotrue-defaults.js'
 import { defaultReactEmailSource } from './react-email-defaults.js'
@@ -108,11 +109,13 @@ import {
   getEmailTemplate,
   getFunctionSecrets,
   migrate,
+  type Queryable,
   updateEdgeFunction,
   upsertConfig,
   upsertEdgeFunction,
   upsertEmailTemplate,
   upsertFunctionSecrets,
+  withTransaction,
 } from './store.js'
 import {
   createIntegration,
@@ -123,10 +126,17 @@ import {
   syncThirdPartyJwks,
   type ThirdPartyIntegration,
 } from './third-party-auth.js'
+import { redactWriteOnlyKeys } from './write-only.js'
 
 const app = new Hono()
 
 app.use(logger())
+
+app.onError((err, c) => {
+  if (err instanceof SyntaxError) return c.json({ message: 'body must be valid JSON' }, 400)
+  console.error(err)
+  return c.json({ message: 'Internal Server Error' }, 500)
+})
 
 app.get('/health', (c) => c.json({ status: 'ok' }))
 
@@ -154,6 +164,29 @@ app.use('/platform/*', async (c, next) => {
   }
   await next()
 })
+
+const MAX_BODY_BYTES = 4 * 1024 * 1024
+const MAX_FUNCTION_DEPLOY_BODY_BYTES = 12 * 1024 * 1024
+const FUNCTION_DEPLOY_PATH_RE = /^\/platform\/projects\/[^/]+\/functions\/deploy$/
+
+app.use('/platform/*', (c, next) =>
+  bodyLimit({
+    maxSize: FUNCTION_DEPLOY_PATH_RE.test(c.req.path)
+      ? MAX_FUNCTION_DEPLOY_BODY_BYTES
+      : MAX_BODY_BYTES,
+    onError: (c) => c.json({ message: 'request body is too large' }, 413),
+  })(c, next)
+)
+
+async function readJsonObject(c: Context): Promise<Record<string, unknown> | null> {
+  try {
+    const body: unknown = await c.req.json()
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) return null
+    return body as Record<string, unknown>
+  } catch {
+    return null
+  }
+}
 
 // Records every mutating request for the account audit log page.
 app.use('/platform/*', async (c, next) => {
@@ -251,28 +284,38 @@ async function resolveAuthRef(ref: string): Promise<string | null> {
   return ref
 }
 
-async function applyConfigPatch(ref: string, payload: Record<string, unknown>) {
-  const { valid, errors } = validateConfigPayload(payload)
-  if (errors.length > 0) return { errors }
-
-  // Template content updates also materialize a rendered template that
-  // GoTrue fetches over HTTP.
-  for (const [key, value] of Object.entries(valid)) {
+async function storeHtmlTemplates(
+  ref: string,
+  config: Record<string, ConfigValue>,
+  tx: Queryable
+): Promise<void> {
+  for (const [key, value] of Object.entries(config)) {
     const templateType = templateTypeFromConfigKey(key)
     if (!templateType) continue
     if (value === null) {
-      await deleteEmailTemplate(ref, templateType)
+      await deleteEmailTemplate(ref, templateType, tx)
     } else if (typeof value === 'string') {
-      await upsertEmailTemplate(ref, {
-        template_type: templateType,
-        source: value,
-        source_format: 'html',
-        rendered_html: value,
-      })
+      await upsertEmailTemplate(
+        ref,
+        {
+          template_type: templateType,
+          source: value,
+          source_format: 'html',
+          rendered_html: value,
+        },
+        tx
+      )
     }
   }
+}
 
-  await upsertConfig(ref, valid)
+async function applyConfigPatch(ref: string, payload: Record<string, unknown>) {
+  const { valid, errors } = validateConfigPayload(payload)
+  if (errors.length > 0) return { errors }
+  await withTransaction(async (tx) => {
+    await storeHtmlTemplates(ref, valid, tx)
+    await upsertConfig(ref, valid, tx)
+  })
   await syncEnvFile(ref)
   return { errors: [] as string[] }
 }
@@ -313,8 +356,7 @@ async function currentConfig(ref: string) {
   // (mirrors the env file materialization in envfile.ts).
   if (ref !== 'default') merged = await withSmtpFallback(merged)
   return {
-    ...defaultAuthConfig(),
-    ...merged,
+    ...redactWriteOnlyKeys({ ...defaultAuthConfig(), ...merged }),
     MAILER_TEMPLATES_CUSTOM_CONTENTS: templatesCustom,
     MAILER_SUBJECTS_CUSTOM_CONTENTS: subjectsCustom,
   }
@@ -329,7 +371,8 @@ app.get('/platform/auth/:ref/config', async (c) => {
 app.patch('/platform/auth/:ref/config', async (c) => {
   const ref = await resolveAuthRef(c.req.param('ref'))
   if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
-  const payload = await c.req.json<Record<string, unknown>>()
+  const payload = await readJsonObject(c)
+  if (!payload) return c.json({ message: 'body must be a JSON object' }, 400)
   const { errors } = await applyConfigPatch(ref, payload)
   if (errors.length > 0) return c.json({ message: errors.join('; ') }, 400)
   return c.json(await currentConfig(ref))
@@ -338,7 +381,8 @@ app.patch('/platform/auth/:ref/config', async (c) => {
 app.patch('/platform/auth/:ref/config/hooks', async (c) => {
   const ref = await resolveAuthRef(c.req.param('ref'))
   if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
-  const payload = await c.req.json<Record<string, unknown>>()
+  const payload = await readJsonObject(c)
+  if (!payload) return c.json({ message: 'body must be a JSON object' }, 400)
   const { errors } = await applyConfigPatch(ref, payload)
   if (errors.length > 0) return c.json({ message: errors.join('; ') }, 400)
   return c.json(await currentConfig(ref))
@@ -365,11 +409,17 @@ app.post('/platform/auth/:ref/templates/:template/reset', async (c) => {
   if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
   const template = templateParam(c)
   if (!template) return c.json({ message: 'unknown template type' }, 400)
-  await deleteEmailTemplate(ref, template)
-  await deleteConfig(ref, [
-    `MAILER_TEMPLATES_${template.toUpperCase()}_CONTENT`,
-    `MAILER_SUBJECTS_${template.toUpperCase()}`,
-  ])
+  await withTransaction(async (tx) => {
+    await deleteEmailTemplate(ref, template, tx)
+    await deleteConfig(
+      ref,
+      [
+        `MAILER_TEMPLATES_${template.toUpperCase()}_CONTENT`,
+        `MAILER_SUBJECTS_${template.toUpperCase()}`,
+      ],
+      tx
+    )
+  })
   await syncEnvFile(ref)
   return c.json(await currentConfig(ref))
 })
@@ -384,7 +434,7 @@ app.put('/platform/auth/:ref/templates/:template/react', async (c) => {
   if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
   const template = templateParam(c)
   if (!template) return c.json({ message: 'unknown template type' }, 400)
-  const { source } = await c.req.json<{ source?: string }>()
+  const source = (await readJsonObject(c))?.source
   if (!source || typeof source !== 'string') {
     return c.json({ message: 'body must contain a `source` string' }, 400)
   }
@@ -394,17 +444,28 @@ app.put('/platform/auth/:ref/templates/:template/react', async (c) => {
     renderedHtml = await renderReactEmail(source)
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
+    if (err instanceof RenderQueueFullError) return c.json({ message }, 429)
     return c.json({ message: `failed to render template: ${message}` }, 400)
   }
 
-  await upsertEmailTemplate(ref, {
-    template_type: template,
-    source,
-    source_format: 'react',
-    rendered_html: renderedHtml,
-  })
-  await upsertConfig(ref, {
-    [`MAILER_TEMPLATES_${template.toUpperCase()}_CONTENT`]: renderedHtml,
+  await withTransaction(async (tx) => {
+    await upsertEmailTemplate(
+      ref,
+      {
+        template_type: template,
+        source,
+        source_format: 'react',
+        rendered_html: renderedHtml,
+      },
+      tx
+    )
+    await upsertConfig(
+      ref,
+      {
+        [`MAILER_TEMPLATES_${template.toUpperCase()}_CONTENT`]: renderedHtml,
+      },
+      tx
+    )
   })
   await syncEnvFile(ref)
   return c.json({ template_type: template, rendered_html: renderedHtml })

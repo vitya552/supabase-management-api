@@ -1,4 +1,5 @@
-import { mkdir, rename, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 import { AUTH_CONFIG_KEYS } from './auth-config-keys.js'
@@ -8,10 +9,6 @@ import { type ConfigValue, getAllConfig, getAllEmailTemplates } from './store.js
 
 export const MANAGED_ENV_FILE = '90-managed.env'
 
-/**
- * Keys that are stored as plain numbers by the platform API but read by
- * GoTrue as Go durations, with the unit the dashboard uses for each.
- */
 const DURATION_KEYS: Record<string, 'hours' | 'seconds'> = {
   SESSIONS_TIMEBOX: 'hours',
   SESSIONS_INACTIVITY_TIMEOUT: 'hours',
@@ -20,10 +17,8 @@ const DURATION_KEYS: Record<string, 'hours' | 'seconds'> = {
   MFA_PHONE_MAX_FREQUENCY: 'seconds',
 }
 
-/** MAILER_TEMPLATES_<TYPE>_CONTENT keys are materialized as template URLs. */
 const TEMPLATE_CONTENT_RE = /^MAILER_TEMPLATES_([A-Z0-9_]+)_CONTENT$/
 
-/** EXTERNAL_<PROVIDER>_ENABLED keys whose provider needs a redirect URI. */
 const EXTERNAL_ENABLED_RE = /^EXTERNAL_([A-Z0-9_]+)_ENABLED$/
 const NO_REDIRECT_URI_PROVIDERS = new Set([
   'EMAIL',
@@ -38,26 +33,36 @@ export function templateTypeFromConfigKey(key: string): string | null {
   return match ? match[1].toLowerCase() : null
 }
 
-function escapeEnvValue(value: string): string {
-  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
+export function escapeEnvValue(value: string): string {
+  return `"${value
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\$/g, '\\$')
+    .replace(/\n/g, '\\n')}"`
+}
+
+function serializeDuration(value: number, unit: 'hours' | 'seconds'): string | null {
+  if (value === 0) return null
+  return unit === 'hours' ? `${value}h` : `${value}s`
 }
 
 function serializeValue(key: string, value: ConfigValue): string | null {
   if (value === null) return null
   const durationUnit = DURATION_KEYS[key]
   if (durationUnit !== undefined && typeof value === 'number') {
-    // GoTrue treats a zero duration as invalid; omit the line so the
-    // built-in default ("never") applies.
-    if (value === 0) return null
-    return durationUnit === 'hours' ? `${value}h` : `${value}s`
+    return serializeDuration(value, durationUnit)
   }
   return String(value)
 }
 
+function providerNeedingRedirectUri(key: string, value: ConfigValue): string | null {
+  const providerMatch = key.match(EXTERNAL_ENABLED_RE)
+  if (!providerMatch || value !== true) return null
+  return NO_REDIRECT_URI_PROVIDERS.has(providerMatch[1]) ? null : providerMatch[1]
+}
+
 export type EnvFileOptions = {
-  /** OAuth redirect URI derived for the target GoTrue instance. */
   callbackUrl: string
-  /** URL GoTrue fetches a rendered template from, per template type. */
   templateUrl: (templateType: string) => string
 }
 
@@ -72,8 +77,7 @@ export function renderEnvFile(
     '# live-reloaded by GoTrue (auth --config-dir).',
   ]
 
-  const sortedKeys = Object.keys(config).sort()
-  for (const key of sortedKeys) {
+  for (const key of Object.keys(config).sort()) {
     if (!(key in AUTH_CONFIG_KEYS)) continue
     if (TEMPLATE_CONTENT_RE.test(key)) continue
 
@@ -81,24 +85,13 @@ export function renderEnvFile(
     if (serialized === null) continue
     lines.push(`GOTRUE_${key}=${escapeEnvValue(serialized)}`)
 
-    // Providers configured at runtime also need their redirect URI set,
-    // which the platform derives instead of storing.
-    const providerMatch = key.match(EXTERNAL_ENABLED_RE)
-    if (
-      providerMatch &&
-      config[key] === true &&
-      !NO_REDIRECT_URI_PROVIDERS.has(providerMatch[1]) &&
-      options.callbackUrl
-    ) {
-      lines.push(
-        `GOTRUE_EXTERNAL_${providerMatch[1]}_REDIRECT_URI=${escapeEnvValue(options.callbackUrl)}`
-      )
+    const provider = providerNeedingRedirectUri(key, config[key])
+    if (provider && options.callbackUrl) {
+      lines.push(`GOTRUE_EXTERNAL_${provider}_REDIRECT_URI=${escapeEnvValue(options.callbackUrl)}`)
     }
   }
 
   for (const templateType of [...templateTypes].sort()) {
-    // The type becomes part of an env variable name, so anything that is not a
-    // plain identifier is skipped rather than escaped.
     if (!/^[a-z0-9_]+$/.test(templateType)) continue
     lines.push(
       `GOTRUE_MAILER_TEMPLATES_${templateType.toUpperCase()}=${escapeEnvValue(
@@ -135,14 +128,11 @@ function envFileOptionsFor(projectRef: string): EnvFileOptions {
   }
 }
 
-/** Regenerates the watched env file for a project from the database state. */
-export async function syncEnvFile(projectRef: string = 'default'): Promise<void> {
+async function writeEnvFile(projectRef: string): Promise<void> {
   const [storedConfig, templates] = await Promise.all([
     getAllConfig(projectRef),
     getAllEmailTemplates(projectRef),
   ])
-  // Projects without their own SMTP configuration inherit the default
-  // project's SMTP so auth emails work out of the box.
   const config =
     projectRef !== 'default' ? await withSmtpFallback(storedConfig) : storedConfig
   const content = renderEnvFile(
@@ -153,8 +143,20 @@ export async function syncEnvFile(projectRef: string = 'default'): Promise<void>
 
   const target = join(authConfigDirFor(projectRef), MANAGED_ENV_FILE)
   await mkdir(dirname(target), { recursive: true })
-  // Write-then-rename so GoTrue never reads a partially written file.
-  const tmp = `${target}.tmp`
-  await writeFile(tmp, content, 'utf8')
-  await rename(tmp, target)
+  const tmp = `${target}.${randomUUID()}.tmp`
+  try {
+    await writeFile(tmp, content, 'utf8')
+    await rename(tmp, target)
+  } catch (err) {
+    await rm(tmp, { force: true })
+    throw err
+  }
+}
+
+let syncQueue: Promise<void> = Promise.resolve()
+
+export function syncEnvFile(projectRef: string = 'default'): Promise<void> {
+  const run = syncQueue.then(() => writeEnvFile(projectRef))
+  syncQueue = run.catch(() => undefined)
+  return run
 }
