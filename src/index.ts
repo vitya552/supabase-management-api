@@ -1,15 +1,16 @@
-import { serve } from '@hono/node-server'
-import { Hono } from 'hono'
-import { logger } from 'hono/logger'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
+import { serve } from '@hono/node-server'
+import { Hono, type Context } from 'hono'
+import { bodyLimit } from 'hono/body-limit'
+import { logger } from 'hono/logger'
 
+import { listAuditLogs, migrateAuditLogs, recordAuditLog } from './audit-log.js'
 import { AUTH_CONFIG_KEYS } from './auth-config-keys.js'
 import { baselineConfig } from './baseline.js'
 import {
   createMfaPendingToken,
   createSessionToken,
-  type DashboardSessionIdentity,
   getCookie,
   getMfaPendingIdentity,
   getSessionIdentity,
@@ -19,8 +20,9 @@ import {
   isValidSessionToken,
   resetLoginRateLimit,
   sanitizeRedirectPath,
-  sessionCookie,
   SESSION_COOKIE,
+  sessionCookie,
+  type DashboardSessionIdentity,
 } from './dashboard-auth.js'
 import {
   acceptInvitation,
@@ -28,7 +30,6 @@ import {
   createInvitation,
   createUserFactor,
   DASHBOARD_ROLES,
-  type DashboardRole,
   deleteDashboardUser,
   deleteInvitation,
   deleteUserFactor,
@@ -47,52 +48,49 @@ import {
   updateDashboardUserProfile,
   updateDashboardUserRole,
   verifyDashboardUser,
+  type DashboardRole,
 } from './dashboard-users.js'
-import { listAuditLogs, migrateAuditLogs, recordAuditLog } from './audit-log.js'
-import { renderReactEmail } from './emails.js'
-import { generateTotpSecret, totpUri, verifyTotpCode } from './totp.js'
-import { defaultAuthConfig } from './gotrue-defaults.js'
-import { defaultReactEmailSource } from './react-email-defaults.js'
+import { RenderQueueFullError, renderReactEmail } from './emails.js'
 import { env } from './env.js'
 import { syncEnvFile, templateTypeFromConfigKey } from './envfile.js'
 import {
   deleteFunctionFiles,
-  type FunctionFile,
   isValidSlug,
   listFunctionFiles,
   writeFunctionFiles,
   writeManifestFile,
   writeSecretsFile,
+  type FunctionFile,
 } from './functions.js'
+import { defaultAuthConfig } from './gotrue-defaults.js'
 import { isSmtpConfigured, sendInvitationEmail } from './mailer.js'
-import { getRealtimeConfig, updateRealtimeConfig } from './realtime-config.js'
-import { getS3ProtocolInfo, getStorageConfig } from './storage-config.js'
+import {
+  getPostgresConfig,
+  isManagedGuc,
+  updatePostgresConfig,
+  validateGucValue,
+  type PostgresConfigValue,
+} from './postgres-config.js'
+import { getPostgrestConfig, updatePostgrestConfig } from './postgrest.js'
 import {
   getOrganizationMfaEnforced,
   getProject,
   isMfaEnforcedAnywhere,
   listOrganizations,
-  setOrganizationMfaEnforced,
-  updateOrganization,
   listProjects,
   migrateProjects,
+  setOrganizationMfaEnforced,
+  updateOrganization,
   type ProjectRecord,
 } from './projects-store.js'
+import { defaultReactEmailSource } from './react-email-defaults.js'
+import { getRealtimeConfig, updateRealtimeConfig } from './realtime-config.js'
+import { getS3ProtocolInfo, getStorageConfig } from './storage-config.js'
 import {
-  getPostgresConfig,
-  isManagedGuc,
-  type PostgresConfigValue,
-  updatePostgresConfig,
-  validateGucValue,
-} from './postgres-config.js'
-import { getPostgrestConfig, updatePostgrestConfig } from './postgrest.js'
-import {
-  type ConfigValue,
   deleteConfig,
   deleteEdgeFunction,
   deleteEmailTemplate,
   deleteFunctionSecrets,
-  type EdgeFunctionRecord,
   getAllConfig,
   getEdgeFunction,
   getEdgeFunctions,
@@ -104,6 +102,10 @@ import {
   upsertEdgeFunction,
   upsertEmailTemplate,
   upsertFunctionSecrets,
+  withTransaction,
+  type ConfigValue,
+  type EdgeFunctionRecord,
+  type Queryable,
 } from './store.js'
 import {
   createIntegration,
@@ -114,10 +116,18 @@ import {
   syncThirdPartyJwks,
   type ThirdPartyIntegration,
 } from './third-party-auth.js'
+import { generateTotpSecret, totpUri, verifyTotpCode } from './totp.js'
+import { redactWriteOnlyKeys } from './write-only.js'
 
 const app = new Hono()
 
 app.use(logger())
+
+app.onError((err, c) => {
+  if (err instanceof SyntaxError) return c.json({ message: 'body must be valid JSON' }, 400)
+  console.error(err)
+  return c.json({ message: 'Internal Server Error' }, 500)
+})
 
 app.get('/health', (c) => c.json({ status: 'ok' }))
 
@@ -138,13 +148,35 @@ function isValidApiToken(authorization: string): boolean {
   return expected.length === provided.length && timingSafeEqual(expected, provided)
 }
 
-// Everything under /platform requires the management token.
 app.use('/platform/*', async (c, next) => {
   if (!isValidApiToken(c.req.header('authorization') ?? '')) {
     return c.json({ message: 'Unauthorized' }, 401)
   }
   await next()
 })
+
+const MAX_BODY_BYTES = 4 * 1024 * 1024
+const MAX_FUNCTION_DEPLOY_BODY_BYTES = 12 * 1024 * 1024
+const FUNCTION_DEPLOY_PATH_RE = /^\/platform\/projects\/[^/]+\/functions\/deploy$/
+
+app.use('/platform/*', (c, next) =>
+  bodyLimit({
+    maxSize: FUNCTION_DEPLOY_PATH_RE.test(c.req.path)
+      ? MAX_FUNCTION_DEPLOY_BODY_BYTES
+      : MAX_BODY_BYTES,
+    onError: (c) => c.json({ message: 'request body is too large' }, 413),
+  })(c, next)
+)
+
+async function readJsonObject(c: Context): Promise<Record<string, unknown> | null> {
+  try {
+    const body: unknown = await c.req.json()
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) return null
+    return body as Record<string, unknown>
+  } catch {
+    return null
+  }
+}
 
 // Records every mutating request for the account audit log page.
 app.use('/platform/*', async (c, next) => {
@@ -175,8 +207,7 @@ const MFA_EXEMPT_PATTERN = /^\/platform\/organizations(\/[^/]+(\/members\/mfa\/e
 app.use('/platform/*', async (c, next) => {
   const path = c.req.path
   const isExempt =
-    MFA_EXEMPT_PREFIXES.some((prefix) => path.startsWith(prefix)) ||
-    MFA_EXEMPT_PATTERN.test(path)
+    MFA_EXEMPT_PREFIXES.some((prefix) => path.startsWith(prefix)) || MFA_EXEMPT_PATTERN.test(path)
   if (!isExempt && (await isMfaEnforcedAnywhere())) {
     const identity = await requestIdentity(c)
     if (identity === 'invalid') {
@@ -253,7 +284,10 @@ function validateConfigPayload(payload: Record<string, unknown>): {
       valid[key] = null
       continue
     }
-    if (typeof value === expected && (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean')) {
+    if (
+      typeof value === expected &&
+      (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean')
+    ) {
       valid[key] = value
       continue
     }
@@ -262,38 +296,46 @@ function validateConfigPayload(payload: Record<string, unknown>): {
   return { valid, errors }
 }
 
-/** Resolves which project an auth config request targets. */
 async function resolveAuthRef(ref: string): Promise<string | null> {
   return ref === 'default' ? 'default' : null
+}
+
+async function storeHtmlTemplates(
+  ref: string,
+  config: Record<string, ConfigValue>,
+  tx: Queryable
+): Promise<void> {
+  for (const [key, value] of Object.entries(config)) {
+    const templateType = templateTypeFromConfigKey(key)
+    if (!templateType) continue
+    if (value === null) {
+      await deleteEmailTemplate(ref, templateType, tx)
+    } else if (typeof value === 'string') {
+      await upsertEmailTemplate(
+        ref,
+        {
+          template_type: templateType,
+          source: value,
+          source_format: 'html',
+          rendered_html: value,
+        },
+        tx
+      )
+    }
+  }
 }
 
 async function applyConfigPatch(ref: string, payload: Record<string, unknown>) {
   const { valid, errors } = validateConfigPayload(payload)
   if (errors.length > 0) return { errors }
-
-  // Template content updates also materialize a rendered template that
-  // GoTrue fetches over HTTP.
-  for (const [key, value] of Object.entries(valid)) {
-    const templateType = templateTypeFromConfigKey(key)
-    if (!templateType) continue
-    if (value === null) {
-      await deleteEmailTemplate(ref, templateType)
-    } else if (typeof value === 'string') {
-      await upsertEmailTemplate(ref, {
-        template_type: templateType,
-        source: value,
-        source_format: 'html',
-        rendered_html: value,
-      })
-    }
-  }
-
-  await upsertConfig(ref, valid)
+  await withTransaction(async (tx) => {
+    await storeHtmlTemplates(ref, valid, tx)
+    await upsertConfig(ref, valid, tx)
+  })
   await syncEnvFile()
   return { errors: [] as string[] }
 }
 
-/** Config keys whose values are credentials and must not reach non-admins. */
 const SENSITIVE_CONFIG_KEY_RE = /SECRET|_PASS$|API_KEY|ACCESS_KEY|AUTH_TOKEN|PRIVATE_KEY/
 
 function redactSensitiveConfig<T extends Record<string, unknown>>(config: T): T {
@@ -314,13 +356,8 @@ async function currentConfig(ref: string) {
     if (/^MAILER_TEMPLATES_.+_CONTENT$/.test(key)) templatesCustom[key] = true
     else if (key.startsWith('MAILER_SUBJECTS_')) subjectsCustom[key] = true
   }
-  const merged = {
-    ...baselineConfig(),
-    ...stored,
-  }
   return {
-    ...defaultAuthConfig(),
-    ...merged,
+    ...redactWriteOnlyKeys({ ...defaultAuthConfig(), ...baselineConfig(), ...stored }),
     MAILER_TEMPLATES_CUSTOM_CONTENTS: templatesCustom,
     MAILER_SUBJECTS_CUSTOM_CONTENTS: subjectsCustom,
   }
@@ -330,8 +367,6 @@ app.get('/platform/auth/:ref/config', async (c) => {
   const ref = await resolveAuthRef(c.req.param('ref'))
   if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
   const config = await currentConfig(ref)
-  // Provider/SMTP/hook credentials are only shown to owners and admins;
-  // developers get the config shape with the secret values blanked.
   return c.json((await canAdminister(c)) ? config : redactSensitiveConfig(config))
 })
 
@@ -341,7 +376,8 @@ app.patch('/platform/auth/:ref/config', async (c) => {
   }
   const ref = await resolveAuthRef(c.req.param('ref'))
   if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
-  const payload = await c.req.json<Record<string, unknown>>()
+  const payload = await readJsonObject(c)
+  if (!payload) return c.json({ message: 'body must be a JSON object' }, 400)
   const { errors } = await applyConfigPatch(ref, payload)
   if (errors.length > 0) return c.json({ message: errors.join('; ') }, 400)
   return c.json(await currentConfig(ref))
@@ -353,17 +389,13 @@ app.patch('/platform/auth/:ref/config/hooks', async (c) => {
   }
   const ref = await resolveAuthRef(c.req.param('ref'))
   if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
-  const payload = await c.req.json<Record<string, unknown>>()
+  const payload = await readJsonObject(c)
+  if (!payload) return c.json({ message: 'body must be a JSON object' }, 400)
   const { errors } = await applyConfigPatch(ref, payload)
   if (errors.length > 0) return c.json({ message: errors.join('; ') }, 400)
   return c.json(await currentConfig(ref))
 })
 
-/**
- * Template types GoTrue knows about, derived from the config keys it accepts.
- * Anything else is rejected so a template name can never reach the generated
- * env file, whose lines are keyed by it.
- */
 const TEMPLATE_TYPES = new Set(
   Object.keys(AUTH_CONFIG_KEYS)
     .map(templateTypeFromConfigKey)
@@ -383,20 +415,21 @@ app.post('/platform/auth/:ref/templates/:template/reset', async (c) => {
   if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
   const template = templateParam(c)
   if (!template) return c.json({ message: 'unknown template type' }, 400)
-  await deleteEmailTemplate(ref, template)
-  await deleteConfig(ref, [
-    `MAILER_TEMPLATES_${template.toUpperCase()}_CONTENT`,
-    `MAILER_SUBJECTS_${template.toUpperCase()}`,
-  ])
+  await withTransaction(async (tx) => {
+    await deleteEmailTemplate(ref, template, tx)
+    await deleteConfig(
+      ref,
+      [
+        `MAILER_TEMPLATES_${template.toUpperCase()}_CONTENT`,
+        `MAILER_SUBJECTS_${template.toUpperCase()}`,
+      ],
+      tx
+    )
+  })
   await syncEnvFile()
   return c.json(await currentConfig(ref))
 })
 
-/**
- * React email templates (self-hosted extension endpoint). Accepts TSX
- * source with a react-email component as its default export, renders it to
- * HTML and wires it up as the GoTrue template for the given type.
- */
 app.put('/platform/auth/:ref/templates/:template/react', async (c) => {
   if (!(await canAdminister(c))) {
     return c.json({ message: 'only owners and admins can update email templates' }, 403)
@@ -405,7 +438,7 @@ app.put('/platform/auth/:ref/templates/:template/react', async (c) => {
   if (!ref) return c.json({ message: 'Auth is not available for this project' }, 404)
   const template = templateParam(c)
   if (!template) return c.json({ message: 'unknown template type' }, 400)
-  const { source } = await c.req.json<{ source?: string }>()
+  const source = (await readJsonObject(c))?.source
   if (!source || typeof source !== 'string') {
     return c.json({ message: 'body must contain a `source` string' }, 400)
   }
@@ -415,17 +448,28 @@ app.put('/platform/auth/:ref/templates/:template/react', async (c) => {
     renderedHtml = await renderReactEmail(source)
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
+    if (err instanceof RenderQueueFullError) return c.json({ message }, 429)
     return c.json({ message: `failed to render template: ${message}` }, 400)
   }
 
-  await upsertEmailTemplate(ref, {
-    template_type: template,
-    source,
-    source_format: 'react',
-    rendered_html: renderedHtml,
-  })
-  await upsertConfig(ref, {
-    [`MAILER_TEMPLATES_${template.toUpperCase()}_CONTENT`]: renderedHtml,
+  await withTransaction(async (tx) => {
+    await upsertEmailTemplate(
+      ref,
+      {
+        template_type: template,
+        source,
+        source_format: 'react',
+        rendered_html: renderedHtml,
+      },
+      tx
+    )
+    await upsertConfig(
+      ref,
+      {
+        [`MAILER_TEMPLATES_${template.toUpperCase()}_CONTENT`]: renderedHtml,
+      },
+      tx
+    )
   })
   await syncEnvFile()
   return c.json({ template_type: template, rendered_html: renderedHtml })
@@ -525,7 +569,10 @@ app.post('/platform/projects/:ref/functions/deploy', async (c) => {
   for (const entry of form.getAll('file')) {
     if (typeof entry === 'string') continue
     if (files.length >= MAX_FUNCTION_FILES) {
-      return c.json({ message: `a function may not have more than ${MAX_FUNCTION_FILES} files` }, 413)
+      return c.json(
+        { message: `a function may not have more than ${MAX_FUNCTION_FILES} files` },
+        413
+      )
     }
     const content = await entry.text()
     totalBytes += Buffer.byteLength(content, 'utf8')
@@ -703,9 +750,7 @@ function thirdPartyResponse(integration: ThirdPartyIntegration) {
     jwks_url: integration.jwks_url,
     custom_jwks: integration.custom_jwks,
     resolved_jwks: integration.resolved_jwks,
-    resolved_at: integration.resolved_at
-      ? new Date(integration.resolved_at).toISOString()
-      : null,
+    resolved_at: integration.resolved_at ? new Date(integration.resolved_at).toISOString() : null,
     inserted_at: new Date(integration.inserted_at).toISOString(),
     updated_at: new Date(integration.updated_at).toISOString(),
   }
@@ -797,9 +842,7 @@ app.post('/dashboard-auth/login', async (c) => {
   // supplied and would let an attacker rotate the rate limit key.
   const forwardedFor = c.req.header('x-forwarded-for')?.split(',') ?? []
   const clientKey =
-    c.req.header('x-envoy-external-address') ||
-    forwardedFor.at(-1)?.trim() ||
-    'unknown'
+    c.req.header('x-envoy-external-address') || forwardedFor.at(-1)?.trim() || 'unknown'
   if (isLoginRateLimited(clientKey)) {
     return c.json({ message: 'Too many sign in attempts, try again later' }, 429)
   }
@@ -866,8 +909,7 @@ app.post('/dashboard-auth/accept-invitation', async (c) => {
     return c.json({ message: 'Too many attempts, try again later' }, 429)
   }
 
-  const payload = await c
-    .req
+  const payload = await c.req
     .json<{ token?: string; username?: string; password?: string }>()
     .catch(() => null)
   if (!payload?.token || typeof payload.token !== 'string') {
@@ -896,7 +938,10 @@ app.post('/dashboard-auth/accept-invitation', async (c) => {
     return c.json({ message: 'username already exists' }, 409)
   }
   resetLoginRateLimit(clientKey)
-  c.header('Set-Cookie', sessionCookie(createSessionToken({ username: result.username, role: result.role })))
+  c.header(
+    'Set-Cookie',
+    sessionCookie(createSessionToken({ username: result.username, role: result.role }))
+  )
   const [organization] = await listOrganizations()
   return c.json(
     {
@@ -1146,10 +1191,7 @@ app.patch('/platform/profile', async (c) => {
     return c.json({ message: 'session is no longer valid' }, 401)
   }
   if (!identity) return c.json({ message: 'sign in to update your profile' }, 401)
-  const payload = await c
-    .req
-    .json<{ first_name?: string; last_name?: string }>()
-    .catch(() => null)
+  const payload = await c.req.json<{ first_name?: string; last_name?: string }>().catch(() => null)
   if (payload === null) return c.json({ message: 'invalid payload' }, 400)
   const firstName = typeof payload.first_name === 'string' ? payload.first_name.trim() : ''
   const lastName = typeof payload.last_name === 'string' ? payload.last_name.trim() : ''
@@ -1171,8 +1213,7 @@ app.post('/platform/profile/password', async (c) => {
   if (!identity) {
     return c.json({ message: 'sign in to change your password' }, 401)
   }
-  const payload = await c
-    .req
+  const payload = await c.req
     .json<{ current_password?: string; new_password?: string }>()
     .catch(() => null)
   const currentPassword = payload?.current_password
@@ -1273,8 +1314,7 @@ app.post('/platform/dashboard-users', async (c) => {
   if (!(await canAdminister(c))) {
     return c.json({ message: 'only owners and admins can manage users' }, 403)
   }
-  const payload = await c
-    .req
+  const payload = await c.req
     .json<{ username?: string; password?: string; role?: string }>()
     .catch(() => null)
   if (
@@ -1366,10 +1406,7 @@ app.post('/platform/dashboard-users/invitations', async (c) => {
   if (!(await canAdminister(c))) {
     return c.json({ message: 'only owners and admins can invite users' }, 403)
   }
-  const payload = await c
-    .req
-    .json<{ role?: string; invited_email?: string }>()
-    .catch(() => null)
+  const payload = await c.req.json<{ role?: string; invited_email?: string }>().catch(() => null)
   const role = payload?.role ?? 'developer'
   if (!DASHBOARD_ROLES.has(role)) {
     return c.json({ message: 'role must be owner, admin or developer' }, 400)
