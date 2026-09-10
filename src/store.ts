@@ -54,6 +54,11 @@ export async function migrate(): Promise<void> {
       value text not null,
       updated_at timestamptz not null default now()
     );
+    create table if not exists management.realtime_config (
+      project_ref text primary key,
+      config jsonb not null,
+      updated_at timestamptz not null default now()
+    );
     alter table management.edge_functions
       add column if not exists project_ref text not null default 'default';
     alter table management.function_secrets
@@ -321,6 +326,40 @@ export async function deleteConfig(
 export async function deleteProjectAuthData(projectRef: string): Promise<void> {
   await pool.query('delete from management.auth_config where project_ref = $1', [projectRef])
   await pool.query('delete from management.email_templates where project_ref = $1', [projectRef])
+}
+
+export type StoredRealtimeConfig = Record<string, number | boolean>
+
+export async function getStoredRealtimeConfig(
+  projectRef: string,
+  db: Queryable = pool
+): Promise<StoredRealtimeConfig | null> {
+  const { rows } = await db.query(
+    'select config from management.realtime_config where project_ref = $1',
+    [projectRef]
+  )
+  if (rows.length === 0) return null
+  return rows[0].config as StoredRealtimeConfig
+}
+
+export async function mergeStoredRealtimeConfig(
+  projectRef: string,
+  updates: StoredRealtimeConfig,
+  db: Queryable = pool
+): Promise<void> {
+  await db.query(
+    `insert into management.realtime_config (project_ref, config) values ($1, $2::jsonb)
+     on conflict (project_ref) do update
+       set config = management.realtime_config.config || excluded.config, updated_at = now()`,
+    [projectRef, JSON.stringify(updates)]
+  )
+}
+
+export async function deleteStoredRealtimeConfig(
+  projectRef: string,
+  db: Queryable = pool
+): Promise<void> {
+  await db.query('delete from management.realtime_config where project_ref = $1', [projectRef])
 }
 
 export type EmailTemplate = {

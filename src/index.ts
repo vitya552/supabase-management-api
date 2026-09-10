@@ -84,7 +84,12 @@ import {
   type ProjectRecord,
 } from './projects-store.js'
 import { defaultReactEmailSource } from './react-email-defaults.js'
-import { getRealtimeConfig, updateRealtimeConfig } from './realtime-config.js'
+import {
+  getRealtimeConfig,
+  startRealtimeReconciler,
+  updateRealtimeConfig,
+  validateRealtimeUpdates,
+} from './realtime-config.js'
 import { getS3ProtocolInfo, getStorageConfig } from './storage-config.js'
 import {
   deleteConfig,
@@ -1116,6 +1121,8 @@ app.patch('/platform/projects/:ref/config/realtime', async (c) => {
   }
   const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null
   if (body === null) return c.json({ message: 'invalid JSON body' }, 400)
+  const validationError = validateRealtimeUpdates(body)
+  if (validationError) return c.json({ message: validationError }, 400)
   const config = await updateRealtimeConfig(c.req.param('ref'), body)
   if (config === null) {
     return c.json({ message: 'Realtime is not available for this project' }, 404)
@@ -1554,6 +1561,7 @@ async function main() {
   // has to exist (with the stack's own keys) before PostgREST starts.
   await syncThirdPartyJwks()
   if (env.functionsDir) await syncFunctionManifest('default', env.functionsDir)
+  startRealtimeReconciler(async () => ['default'])
   serve({ fetch: app.fetch, port: env.port }, (info) => {
     console.log(`management-api listening on :${info.port}`)
   })

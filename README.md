@@ -138,6 +138,23 @@ curl -X PUT "http://localhost:8085/platform/projects/default/config/database/pos
   -d '{"statement_timeout": "60s", "work_mem": "8MB"}'
 ```
 
+### Realtime configuration
+
+Runtime updates to the Realtime tenant limits (`max_concurrent_users`,
+`max_events_per_second`, `max_presence_events_per_second`,
+`max_payload_size_in_kb`, `private_only`), applied via Realtime's tenant
+admin API and effective immediately. Realtime's `SEED_SELF_HOST` recreates
+the tenant with defaults on every container start, so applied values are also
+saved in `management.realtime_config` and re-applied whenever the live tenant
+drifts (on startup, every 30s, and on each dashboard read).
+
+```bash
+curl -X PATCH "http://localhost:8085/platform/projects/default/config/realtime" \
+  -H "Authorization: Bearer $MANAGEMENT_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"max_concurrent_users": 500, "private_only": true}'
+```
+
 ## Environment
 
 | Var | Default | Description |
