@@ -18,7 +18,11 @@ import {
   updateProjectStatus,
 } from './projects-store.js'
 import { syncEnvFile } from './envfile.js'
-import { deleteProjectAuthData, deleteProjectFunctionData } from './store.js'
+import {
+  deleteProjectAuthData,
+  deleteProjectFunctionData,
+  deleteStoredRealtimeConfig,
+} from './store.js'
 import { deleteProjectIntegrations, syncThirdPartyJwks } from './third-party-auth.js'
 
 const execFileAsync = promisify(execFile)
@@ -401,6 +405,9 @@ export async function deprovisionProject(ref: string): Promise<void> {
     })
     await deleteProjectIntegrations(ref).catch((err) => {
       console.error(`deleting third-party auth for ${ref} failed:`, err)
+    })
+    await deleteStoredRealtimeConfig(ref).catch((err) => {
+      console.error(`deleting realtime config for ${ref} failed:`, err)
     })
     await deleteProjectRecord(ref)
   }
